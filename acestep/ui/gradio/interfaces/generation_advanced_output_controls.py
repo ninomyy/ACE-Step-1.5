@@ -39,7 +39,7 @@ def build_output_controls(
     """
 
     params = init_params or {}
-    initial_audio_format = params.get("audio_format", "mp3")
+    initial_audio_format = params.get("audio_format", "flac")
     initial_mp3_visible = initial_audio_format == "mp3"
     with gr.Accordion(t("generation.advanced_output_section"), open=False, elem_classes=["has-info-container"]):
         with gr.Row():

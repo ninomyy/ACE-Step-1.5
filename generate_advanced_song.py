@@ -1,0 +1,732 @@
+#!/usr/bin/env python3
+"""
+Fully Automated Song Writer and Composer (Ollama 32B + ACE-Step 1.5 XL-turbo)
+This script runs entirely offline on local Mac, utilizing:
+1. Ollama (qwen2.5:32b) to write beautiful Japanese lyrics and generate English music captions.
+2. Memory release hack to immediately unload the 32B model from unified memory.
+3. ACE-Step 1.5 (4B LM + XL-turbo) to compose and generate high-quality FLAC/WAV songs.
+4. Saves final outputs directly to the user's Desktop.
+"""
+
+import os
+import sys
+import json
+import time
+import argparse
+import requests
+import shutil
+from pathlib import Path
+
+# Increase ACE-Step internal generation timeout to 1 hour (3600s) to accommodate Heun sampler and 50 steps
+os.environ["ACESTEP_GENERATION_TIMEOUT"] = "3600"
+
+# Add project root to Python path
+PROJECT_ROOT = Path(__file__).parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from loguru import logger
+from acestep.handler import AceStepHandler
+from acestep.llm_inference import LLMHandler
+from acestep.inference import GenerationParams, GenerationConfig, generate_music
+
+OLLAMA_API_URL = "http://127.0.0.1:11434/api/generate"
+DEFAULT_MODEL = "qwen3.6:27b"
+
+def parse_lyrics_file(file_path):
+    """Parse theme, caption, lyrics, and lyrics_hiragana from a generated lyrics file."""
+    logger.info(f"Reading and parsing existing lyrics file: {file_path}")
+    with open(file_path, "r", encoding="utf-8") as f:
+        content = f.read()
+    
+    # Clean carriage returns for standard splitting
+    content = content.replace("\r\n", "\n")
+    
+    theme = ""
+    # Parse Theme
+    import re
+    theme_match = re.search(r"^\s*Theme:\s*(.+)$", content, re.MULTILINE)
+    if theme_match:
+        theme = theme_match.group(1).strip()
+        
+    estimated_duration = 0
+    # Parse Target Duration
+    duration_match = re.search(r"^\s*Target Duration:\s*(\d+)s", content, re.MULTILINE)
+    if duration_match:
+        estimated_duration = int(duration_match.group(1))
+        
+    # Split by sections
+    lyrics_section = ""
+    lyrics_hira_section = ""
+    caption_section = ""
+    
+    try:
+        if "■ 歌詞（漢字かな混じり - 通常表示用）" in content:
+            parts = content.split("■ 歌詞（漢字かな混じり - 通常表示用）")
+            if len(parts) > 1:
+                sub_content = parts[1]
+                if "-----------------------------------------------------" in sub_content:
+                    sub_content = sub_content.split("-----------------------------------------------------", 1)[1]
+                if "■" in sub_content:
+                    lyrics_section = sub_content.split("■", 1)[0].strip()
+                else:
+                    lyrics_section = sub_content.strip()
+                    
+        if "■ 歌詞（ひらがな - ACE-Step 歌唱入力用）" in content:
+            parts = content.split("■ 歌詞（ひらがな - ACE-Step 歌唱入力用）")
+            if len(parts) > 1:
+                sub_content = parts[1]
+                if "-----------------------------------------------------" in sub_content:
+                    sub_content = sub_content.split("-----------------------------------------------------", 1)[1]
+                if "■" in sub_content:
+                    lyrics_hira_section = sub_content.split("■", 1)[0].strip()
+                else:
+                    lyrics_hira_section = sub_content.strip()
+                    
+        if "■ 音楽構成プロンプト (Music Caption)" in content:
+            parts = content.split("■ 音楽構成プロンプト (Music Caption)")
+            if len(parts) > 1:
+                sub_content = parts[1]
+                if "-----------------------------------------------------" in sub_content:
+                    sub_content = sub_content.split("-----------------------------------------------------", 1)[1]
+                caption_section = sub_content.strip()
+    except Exception as parse_err:
+        logger.error(f"Error parsing lyrics file sections: {str(parse_err)}")
+        
+    return theme, caption_section, lyrics_section, lyrics_hira_section, estimated_duration
+
+def get_lyrics_and_caption_from_ollama(theme, duration, model_name=DEFAULT_MODEL):
+    """Call Ollama API to generate lyrics and caption based on the theme."""
+    logger.info(f"Generating lyrics, hiragana lyrics, and music caption via Ollama ({model_name})...")
+    
+    if duration == 0:
+        duration_instruction = """The target song duration is set to dynamic mode. You MUST write a FULL-LENGTH song (3 to 5 minutes). 
+To achieve this, you MUST include a complete and long structure:
+[Intro]
+[Verse 1]
+[Pre-Chorus]
+[Chorus]
+[Verse 2]
+[Pre-Chorus]
+[Chorus]
+[Bridge]
+[Guitar Solo] or [Instrumental Break]
+[Final Chorus]
+[Outro]
+
+CRITICAL: Do NOT write a short song. You must write at least 30 to 40 lines of lyrics. Do not abbreviate."""
+    else:
+        duration_instruction = f"The target song duration is strictly set to {duration} seconds. Adjust the length and pacing of the lyrics so that the vocal performance and structure fit comfortably within this duration."
+
+    prompt = f"""
+You are an expert Music Producer and Songwriter for Japanese City Pop.
+Based on the theme below, generate a beautiful Japanese lyric for a female vocalist, and a matching English Music Caption for ACE-Step 1.5.
+
+Theme: {theme}
+{duration_instruction}
+
+Rules:
+1. For [Music Caption], write in English. It MUST include specific technical tags to ensure highest musical quality:
+   - "studio quality, high-fidelity, pristine audio, professional mixing, 48kHz, lossless"
+   - Specify vocal style clearly (e.g., "breathy whisper voice", "emotional falsetto", "powerful belting", "clear female vocal").
+   - CRITICAL: If the user specifies a BPM, Key, or Time Signature in the Theme, you MUST use those EXACT values in the English caption. DO NOT change them.
+   - Describe the genre (City Pop) and instruments (synthesizers, grooving bass, brass). 
+   - Crucially, analyze the theme and determine the ending style. Describe this chosen ending clearly in English at the end of the [Music Caption] (e.g., "ends with a smooth 15-second instrumental fade-out" or "concludes with a clean, dramatic final piano chord").
+2. For [Lyrics], write in Japanese (Kanji/Kana mix). To achieve a dramatic J-Pop/City Pop structure, use THESE specific structural tags in square brackets:
+   [Intro], [Verse 1], [Pre-Chorus], [Chorus], [Instrumental Break], [Quiet Chorus], [Final Chorus], [Outro].
+   Ensure the lyrics are poetic, rhythmic, and fit the city pop melody.
+3. For [Lyrics Hiragana], write the EXACT SAME lyrics as in Rule 2, but converted entirely into Hiragana (ひらがな) and Katakana (for loan words) to prevent the vocal synthesis model from mispronouncing the words.
+   - Do NOT convert the structural tags (like [Intro], [Chorus]) into hiragana—keep them in English brackets.
+   - Crucially, verify all Japanese dictionary readings for absolute correctness and avoid common pronunciation/spelling traps:
+     * "遠く" must be spelled as "とおく" (NOT "とうく")
+     * "通り" must be spelled as "とおり" (NOT "とうり")
+     * "多く" must be spelled as "おおく" (NOT "おうく")
+     * "雨滴" must be read as "うてき" (NOT "あめてき")
+     * "雨音" must be read as "あまおと" or "あめおと" (NOT "あめのおと")
+     * "静けさ" must be read as "しずけさ" (NOT "しずかさ")
+     * "耳を澄ませて" must be read as "みみをすませて" (do not omit "み")
+   - Double check that the Hiragana version matches the Kanji/Kana mixed version syllable-by-syllable without omitting any words or characters.
+4. You are allowed to output your thought process or reasoning before the JSON. Take your time to carefully write out a full 3 to 5-minute song. After your reasoning, you MUST output a JSON block containing three keys: "caption", "lyrics", and "lyrics_hiragana".
+
+Response JSON Format:
+{{
+  "caption": "(English caption here)",
+  "lyrics": "(Japanese lyrics in Kanji/Kana mix here)",
+  "lyrics_hiragana": "(Japanese lyrics in Hiragana/Katakana here)"
+}}
+"""
+
+    try:
+        # Increase timeout to 300s to accommodate long reasoning/thinking outputs of Qwen 3.6.
+        # Remove format="json" to prevent Ollama from forcing JSON output constraints during CoT thinking.
+        response = requests.post(
+            OLLAMA_API_URL,
+            json={
+                "model": model_name,
+                "prompt": prompt,
+                "stream": False,
+                "options": {
+                    "temperature": 0.7
+                }
+            },
+            timeout=600
+        )
+        response.raise_for_status()
+        result_json = response.json()
+        
+        # Fallback to 'thinking' field if Ollama misroutes the final response
+        raw_response = result_json.get("response", "").strip()
+        if not raw_response:
+            raw_response = result_json.get("thinking", "").strip()
+            
+        # Robustly extract JSON using regex (handles markdown, <think> blocks, etc.)
+        import re
+        parsed = {}
+        json_match = re.search(r"\{.*\}", raw_response, re.DOTALL)
+        if json_match:
+            try:
+                parsed = json.loads(json_match.group(0))
+            except Exception as parse_err:
+                logger.warning(f"Failed to parse regex matched JSON: {parse_err}")
+                
+        if not parsed:
+            # Fallback direct load
+            parsed = json.loads(raw_response)
+            
+        caption = parsed.get("caption", "").strip()
+        lyrics = parsed.get("lyrics", "").strip()
+        lyrics_hiragana = parsed.get("lyrics_hiragana", "").strip()
+        
+        if not caption or not lyrics or not lyrics_hiragana:
+            raise ValueError("Ollama returned empty caption, lyrics, or lyrics_hiragana.")
+            
+        return caption, lyrics, lyrics_hiragana
+    except Exception as e:
+        logger.error(f"Error calling Ollama: {str(e)}")
+        # Fallback prompts if Ollama fails
+        logger.warning("Using pre-defined fallback J-Pop / City Pop values.")
+        caption = "A beautiful and melodic Japanese city pop song, clear and emotional female vocal, retro synthesizer chords, grooving bassline, nostalgic 80s urban atmosphere, ending with a smooth instrumental fade-out. Sung in Japanese, high quality, 110 BPM, key of A major."
+        lyrics = "[Intro]\n[Verse 1]\nビルが立ち並ぶ 街 of ネオン\n君の影を 探しているの\n[Chorus]\n真夜中のハイウェイ 走り抜け\n二人だけの世界へ 連れてって\n踊ろうよ 朝が来るまで\n[Outro]"
+        lyrics_hiragana = "[Intro]\n[Verse 1]\nびるがたちならぶ まちのねおん\nきみのかげを ささがしているの\n[Chorus]\nまよなかのはいうぇい はしりぬけ\nふたりだけのせかいへ つれてって\nおどろうよ あさがくるまで\n[Outro]"
+        return caption, lyrics, lyrics_hiragana
+
+def unload_ollama_model(model_name=DEFAULT_MODEL):
+    """Force unload the model from GPU/Unified Memory immediately by setting keep_alive to 0."""
+    logger.info(f"Releasing model {model_name} from Mac memory...")
+    try:
+        response = requests.post(
+            OLLAMA_API_URL,
+            json={
+                "model": model_name,
+                "prompt": "",
+                "keep_alive": 0,
+                "stream": False
+            },
+            timeout=10
+        )
+        response.raise_for_status()
+        logger.info("Ollama memory released successfully.")
+    except Exception as e:
+        logger.warning(f"Failed to force unload Ollama model: {str(e)}")
+
+def detect_keyscale(theme, caption):
+    """
+    Detect the musical keyscale from the Japanese theme or the English caption.
+    Returns standard format like 'C Major', 'A Minor', or '' if not found.
+    """
+    import re
+    # Helper to normalize accidentals
+    def normalize_acc(acc_str):
+        if not acc_str:
+            return ""
+        a = acc_str.lower()
+        if a in ['#', '♯', 'シャープ', 'sharp']:
+            return "#"
+        if a in ['b', '♭', 'フラット', 'flat']:
+            return "b"
+        return ""
+
+    # 1. Try extracting from Japanese theme first (user explicit choice)
+    if theme:
+        # Match pattern: Note + optional hyphen/space + optional accidental + mode
+        # Accidental 'b' and mode 'm' must not be followed by other english letters (using lookahead)
+        matches = re.finditer(r'([A-G])\s*[-]?\s*(#|b(?![a-z])|♯|♭|シャープ|フラット)?\s*(major|minor|Major|Minor|メジャー|マイナー|m(?![a-z]))?', theme, re.IGNORECASE)
+        for m in matches:
+            note = m.group(1).upper()
+            acc_raw = m.group(2)
+            mode_str = m.group(3)
+            
+            acc = normalize_acc(acc_raw)
+            
+            is_minor = False
+            if mode_str:
+                ms = mode_str.lower()
+                if ms in ['minor', 'マイナー', 'm']:
+                    is_minor = True
+            
+            # Check context to verify it's a key, not a random character
+            start_idx = m.start()
+            end_idx = m.end()
+            context_before = theme[max(0, start_idx - 10):start_idx]
+            context_after = theme[end_idx:min(len(theme), end_idx + 10)]
+            
+            has_key_context = (
+                mode_str is not None or
+                acc_raw is not None or
+                "キー" in context_before or "調" in context_after or
+                "key" in context_before.lower() or "で" in context_after
+            )
+            
+            if has_key_context:
+                mode = "Minor" if is_minor else "Major"
+                return f"{note}{acc} {mode}"
+
+    # 2. Try extracting from English caption (Ollama generated key)
+    if caption:
+        # Match "key of/in/key:" followed by note [A-G] and optional flat/sharp/mode
+        match = re.search(r'\b(?:key of|in|key\s*:\s*)\s*([A-G])\s*[-]?\s*(sharp|flat|#|b(?![a-z])|♯|♭)?\s*(major|minor|m(?![a-z]))?\b', caption, re.IGNORECASE)
+        if match:
+            note = match.group(1).upper()
+            acc_str = match.group(2)
+            mode_str = match.group(3)
+            
+            acc = normalize_acc(acc_str)
+                    
+            is_minor = False
+            if mode_str:
+                m = mode_str.lower()
+                if m in ['minor', 'm']:
+                    is_minor = True
+                    
+            mode = "Minor" if is_minor else "Major"
+            return f"{note}{acc} {mode}"
+            
+    return ""
+
+def detect_bpm(theme, caption):
+    """Detect BPM from theme or caption."""
+    import re
+    text = f"{theme} {caption}"
+    match = re.search(r'\b(?:bpm|テンポ|tempo)\s*[:=]?\s*(\d{2,3})\b|\b(\d{2,3})\s*(?:bpm|テンポ|tempo)\b', text, re.IGNORECASE)
+    if match:
+        val = match.group(1) or match.group(2)
+        return int(val)
+    return None
+
+def detect_timesignature(theme, caption):
+    """Detect time signature from theme or caption."""
+    import re
+    text = f"{theme} {caption}"
+    match = re.search(r'\b(3/4|4/4|6/8)(?:\s*(?:time|拍子))?\b', text, re.IGNORECASE)
+    if match:
+        return match.group(1)
+    return ""
+
+def sanitize_caption(theme, caption):
+    """Ensure the caption uses the exact BPM and Key from the theme if specified, overriding LLM hallucinations."""
+    import re
+    
+    theme_key = detect_keyscale(theme, "")
+    theme_bpm = detect_bpm(theme, "")
+    
+    sanitized = caption
+    
+    if theme_key:
+        key_pattern = r'\b(key\s+of\s+|in\s+key\s+of\s+|in\s+|key:\s*)?([A-G]\s*[-]?\s*(?:sharp|flat|#|b|♯|♭)?\s*(?:major|minor|m)(?![a-z]))\b'
+        
+        def replace_key(match):
+            prefix = match.group(1) or "key of "
+            return f"{prefix}{theme_key}"
+            
+        if re.search(key_pattern, sanitized, re.IGNORECASE):
+            sanitized = re.sub(key_pattern, replace_key, sanitized, flags=re.IGNORECASE)
+        else:
+            sanitized += f", key of {theme_key}"
+            
+    if theme_bpm:
+        bpm_pattern = r'\b(\d{2,3})\s*(?:bpm)\b|\b(?:bpm)\s*(\d{2,3})\b'
+        
+        def replace_bpm(match):
+            if match.group(1):
+                return f"{theme_bpm} BPM"
+            return f"BPM {theme_bpm}"
+            
+        if re.search(bpm_pattern, sanitized, re.IGNORECASE):
+            sanitized = re.sub(bpm_pattern, replace_bpm, sanitized, flags=re.IGNORECASE)
+        else:
+            sanitized += f", {theme_bpm} BPM"
+            
+    return sanitized
+
+def calculate_estimated_duration(lyrics_hiragana):
+    """Calculate an optimal song duration (seconds) based on the volume of lyrics and structural tags."""
+    import re
+    # Extract tags
+    tags = re.findall(r'\[.*?\]', lyrics_hiragana)
+    unique_tags = set(t.lower() for t in tags)
+    
+    instrumental_time = 0
+    if "[intro]" in unique_tags: instrumental_time += 15
+    if "[outro]" in unique_tags: instrumental_time += 15
+    if "[instrumental break]" in unique_tags or "[guitar solo]" in unique_tags: instrumental_time += 15
+    
+    if instrumental_time == 0:
+        instrumental_time = 20
+        
+    # Strip tags, spaces, punctuation to count pure syllables
+    clean_lyrics = re.sub(r'\[.*?\]', '', lyrics_hiragana)
+    clean_lyrics = re.sub(r'[\s　、。！？,.\!\?]', '', clean_lyrics)
+    
+    char_count = len(clean_lyrics)
+    
+    # Approx 3.5 syllables per second for J-Pop
+    vocal_time = int(char_count / 3.5)
+    
+    # Calculate pauses between lines
+    lines = len([line for line in lyrics_hiragana.split('\n') if line.strip() and not line.strip().startswith('[')])
+    pause_time = int(lines * 1.5) # 1.5s pause per lyric line
+    
+    total_time = instrumental_time + vocal_time + pause_time
+    
+    # Constrain to 30s - 360s
+    return max(30, min(total_time, 360))
+
+def get_total_ram_gb():
+    """Check system RAM in GB to determine if parallel model loading is safe."""
+    try:
+        import subprocess
+        out = subprocess.check_output(['sysctl', 'hw.memsize'])
+        mem_bytes = int(out.decode().strip().split(':')[1].strip())
+        return mem_bytes / (1024**3)
+    except Exception:
+        return 32.0
+
+def wait_for_ollama_unload():
+    """Poll Ollama API to confirm models are unloaded, eliminating fixed sleep times."""
+    logger.info("Waiting for Ollama to release memory...")
+    for _ in range(30):
+        try:
+            resp = requests.get("http://127.0.0.1:11434/api/ps", timeout=1)
+            if resp.status_code == 200:
+                models = resp.json().get("models", [])
+                if len(models) == 0:
+                    logger.info("✅ Ollama memory released instantly.")
+                    return
+        except Exception:
+            pass
+        time.sleep(0.1)
+    logger.warning("Ollama memory release confirmation timeout, proceeding anyway.")
+
+def main():
+    parser = argparse.ArgumentParser(description="Auto-Compose song using Ollama + ACE-Step 1.5 XL")
+    parser.add_argument("--theme", type=str, required=True, help="Theme for the song (in Japanese) or path to an existing Lyrics_*.txt file")
+    parser.add_argument("--duration", type=int, default=0, help="Duration of the generated song in seconds (0 = dynamic based on lyrics)")
+    parser.add_argument("--format", type=str, default="flac", choices=["flac", "wav", "mp3"], help="Output audio format")
+    parser.add_argument("--ollama_model", type=str, default=DEFAULT_MODEL, help="Ollama model to use")
+    
+    args = parser.parse_args()
+    
+    t_start = time.time()
+    
+    total_ram_gb = get_total_ram_gb()
+    logger.info(f"System RAM detected: {total_ram_gb:.1f} GB")
+    
+    # Check if args.theme is a path to an existing lyrics file
+    lyrics_file_path = None
+    if os.path.exists(args.theme):
+        lyrics_file_path = args.theme
+    else:
+        # Check Desktop folder
+        desktop_path = os.path.expanduser(f"~/Desktop/{args.theme}")
+        if os.path.exists(desktop_path) and args.theme.endswith(".txt"):
+            lyrics_file_path = desktop_path
+            
+    is_retry = False
+    if lyrics_file_path:
+        # ---- Retry / Re-generation Mode ----
+        logger.info("=====================================================")
+        logger.info("🔄 RE-GENERATION MODE: Re-using existing lyrics and caption")
+        logger.info(f"   Source file: {lyrics_file_path}")
+        logger.info("=====================================================")
+        
+        parsed_theme, caption, lyrics, lyrics_hiragana, estimated_duration = parse_lyrics_file(lyrics_file_path)
+        if parsed_theme and caption and lyrics_hiragana:
+            is_retry = True
+            # Override theme to keep the original theme name for file outputs
+            args.theme = parsed_theme
+            logger.info(f"Parsed Theme: {args.theme}")
+            
+            # LLMの幻覚（異なるBPMやKeyの出力）をユーザー指定値で強制上書き
+            caption = sanitize_caption(args.theme, caption)
+            
+            logger.info("Successfully extracted lyrics and caption. Bypassing Ollama generation.")
+        else:
+            logger.error("Failed to parse lyrics file contents properly. Falling back to normal mode.")
+            
+    def init_models():
+        logger.info("Initializing ACE-Step 1.5 XL-turbo DiT handler...")
+        d_handler = AceStepHandler()
+        s_msg, s_success = d_handler.initialize_service(
+            project_root=str(PROJECT_ROOT),
+            config_path="acestep-v15-xl-sft",
+            device="auto",
+            offload_to_cpu=False,
+        )
+        if not s_success:
+            logger.error(f"DiT initialization failed: {s_msg}")
+            sys.exit(1)
+            
+        logger.info("Initializing ACE-Step 1.5 4B Language Model (LM) handler...")
+        l_handler = LLMHandler()
+        s_msg, s_success = l_handler.initialize(
+            checkpoint_dir=os.path.join(str(PROJECT_ROOT), "checkpoints"),
+            lm_model_path="acestep-5Hz-lm-4B",
+            device="auto",
+            backend="mlx"
+        )
+        if not s_success:
+            logger.error(f"LLM initialization failed: {s_msg}")
+            sys.exit(1)
+        return d_handler, l_handler
+
+    if not is_retry:
+        # ---- 1. Run Ollama 作詞 & プロンプト生成 ----
+        caption, lyrics, lyrics_hiragana = get_lyrics_and_caption_from_ollama(args.theme, args.duration, args.ollama_model)
+        
+        # LLMの幻覚（異なるBPMやKeyの出力）をユーザー指定値で強制上書き
+        caption = sanitize_caption(args.theme, caption)
+        
+        # アルゴリズムで歌詞の文字数とタグから最適な曲の長さを物理計算する（LLMの幻覚を排除）
+        estimated_duration = calculate_estimated_duration(lyrics_hiragana)
+        logger.info(f"✨ Calculated optimal duration based on lyrics volume: {estimated_duration}s")
+        
+        logger.info("\n" + "="*50)
+        logger.info("Generated Music Caption (English):")
+        logger.info(caption)
+        logger.info("-"*50)
+        logger.info("Generated Lyrics (Japanese):")
+        logger.info(lyrics)
+        logger.info("-"*50)
+        logger.info("Generated Lyrics Hiragana (For singing):")
+        logger.info(lyrics_hiragana)
+        logger.info("="*50 + "\n")
+        
+        # ---- 2. Ollamaのメモリを即座に解放 (アンロードハック) ----
+        unload_ollama_model(args.ollama_model)
+        
+        # フラグ立てと同義の即時ポーリングで待ち時間を最小化
+        wait_for_ollama_unload()
+        
+    # ---- 3. ACE-Step 1.5 XL-turbo + 4B LM で作曲とレンダリング ----
+    dit_handler, llm_handler = init_models()
+        
+    logger.info(f"Rendering song: theme='{args.theme}', duration={args.duration}s, format={args.format}...")
+    
+    # Detect keyscale, BPM, and Time Signature from theme or caption
+    detected_key = detect_keyscale(args.theme, caption)
+    detected_bpm = detect_bpm(args.theme, caption)
+    detected_ts = detect_timesignature(args.theme, caption)
+    
+    # Detect fade-out intention
+    fade_out_duration = 0.0
+    text_to_check = f"{caption} {lyrics}".lower()
+    if "fade-out" in text_to_check or "fade out" in text_to_check or "[outro]" in text_to_check:
+        fade_out_duration = 8.0  # 8 seconds professional fade-out
+        
+    if detected_key:
+        logger.info(f"✨ Detected musical keyscale constraint: '{detected_key}'")
+    else:
+        logger.info("ℹ️ No explicit keyscale constraint found. Using model auto-detection.")
+        
+    if detected_bpm:
+        logger.info(f"✨ Detected BPM constraint: {detected_bpm}")
+    if detected_ts:
+        logger.info(f"✨ Detected Time Signature constraint: '{detected_ts}'")
+    if fade_out_duration > 0:
+        logger.info(f"✨ Detected Outro/Fade-out intention. Applying {fade_out_duration}s automatic fade-out mastering.")
+    
+    # 音楽パラメータのチューニング：ACE-Step公式アプリ（Gradio）のデフォルト値に近づけて自然なコード進行を保つ
+    # negative_promptはLMに渡すと音楽コードを破壊して不協和音を生む原因になるため削除（デフォルトの "NO USER INPUT" に任せる）
+    
+    if args.duration == 0 and estimated_duration > 0:
+        actual_duration = estimated_duration
+        if is_retry:
+            logger.info(f"✨ Using parsed target duration from file: {actual_duration}s")
+        else:
+            logger.info(f"✨ Using calculated optimal duration: {actual_duration}s")
+    elif args.duration == 0:
+        actual_duration = calculate_estimated_duration(lyrics_hiragana)
+    else:
+        actual_duration = args.duration
+
+
+    # ---- 3.5. Enhance Caption using ACE-Step LM ----
+    logger.info("✨ Enhancing caption using ACE-Step internal LM (Enhance Caption)...")
+    original_caption = caption
+    try:
+        user_metadata = {
+            "bpm": detected_bpm,
+            "keyscale": detected_key,
+            "timesignature": detected_ts,
+            "vocal_language": "ja"
+        }
+        format_result, _ = llm_handler.format_sample_from_input(
+            caption=caption,
+            lyrics=lyrics_hiragana,
+            user_metadata=user_metadata,
+            temperature=0.8,
+            use_constrained_decoding=True
+        )
+        if format_result and "caption" in format_result and format_result["caption"]:
+            enhanced_caption = format_result["caption"].strip('"\'')
+            if enhanced_caption and enhanced_caption != caption:
+                caption = enhanced_caption
+                logger.info(f"✨ Enhanced Caption: {caption}")
+    except Exception as e:
+        logger.warning(f"Failed to enhance caption: {e}")
+
+
+    # ---- 3.6. Model Detection for Parameters ----
+    model_id = getattr(dit_handler, 'model_id', '').lower()
+    is_turbo = "turbo" in model_id
+    is_sft = "sft" in model_id
+
+    # SFTの場合は高解像度用パラメータ、Turboの場合は高速用パラメータを設定
+    if is_turbo:
+        inference_steps_val = 8
+        shift_val = 1.0
+        dcw_val = True
+        logger.info("⚡ Detected Turbo model. Using Turbo parameters (steps=8, shift=1.0, dcw=True)")
+    elif is_sft:
+        inference_steps_val = 50
+        shift_val = 3.0
+        dcw_val = False
+        logger.info("✨ Detected SFT model. Using SFT parameters (steps=50, shift=3.0, dcw=False)")
+    else:
+        inference_steps_val = 32
+        shift_val = 3.0
+        dcw_val = False
+        logger.info("⚙️ Detected Base model. Using Base parameters (steps=32, shift=3.0, dcw=False)")
+
+    params = GenerationParams(
+        task_type="text2music",
+        thinking=True,
+        caption=caption,
+        lyrics=lyrics_hiragana, # ひらがな歌詞をACE-Stepに渡して歌唱発音ミスを防ぐ
+        vocal_language="ja",
+        duration=actual_duration,
+        keyscale=detected_key,
+        bpm=detected_bpm,
+        timesignature=detected_ts,
+        fade_out_duration=fade_out_duration,
+        inference_steps=inference_steps_val,
+        guidance_scale=7.0, # 最も安定した黄金比（7.0）に戻す
+        use_adg=False,      # 音楽構造の崩壊を防ぐためADGはオフ
+        sampler_mode="euler",# 安定・高速な標準サンプラーに戻す
+        lm_temperature=0.8, # LMの温度を下げて、王道で破綻のないコード進行を生成させる
+        shift=shift_val,
+        dcw_enabled=dcw_val,
+        seed=-1,
+    )
+    
+    config = GenerationConfig(
+        batch_size=1,
+        audio_format=args.format,
+    )
+    
+    # Save directly to a temp folder inside gradio_outputs
+    temp_save_dir = os.path.join(str(PROJECT_ROOT), "gradio_outputs", "autochord_temp")
+    os.makedirs(temp_save_dir, exist_ok=True)
+    
+    # Compose
+    result = generate_music(
+        dit_handler,
+        llm_handler,
+        params=params,
+        config=config,
+        save_dir=temp_save_dir,
+    )
+    
+    # ---- 4. ファイルをユーザーのデスクトップへ移動 ----
+    desktop_dir = os.path.expanduser("~/Desktop")
+    if result.success and result.audios:
+        logger.info("Song generation completed successfully!")
+        for idx, audio in enumerate(result.audios):
+            temp_path = audio.get("path")
+            if temp_path and os.path.exists(temp_path):
+                # 新しいファイル名を作成
+                safe_theme = "".join([c for c in args.theme if c.isalnum() or c in " -_"])[:30]
+                timestamp = int(time.time())
+                final_name = f"Song_{safe_theme}_{timestamp}_{idx+1}.{args.format}"
+                dest_path = os.path.join(desktop_dir, final_name)
+                
+                # デスクトップにコピー
+                shutil.copy(temp_path, dest_path)
+                logger.info(f"🎉 Saved new track to Desktop: {dest_path}")
+                
+                # Metadata (JSON) もコピーして、あとでSFTアップスケールに使えるようにする
+                temp_json_path = os.path.splitext(temp_path)[0] + ".json"
+                json_name = f"Song_{safe_theme}_{timestamp}_{idx+1}.json"
+                json_dest_path = os.path.join(desktop_dir, json_name)
+                if os.path.exists(temp_json_path):
+                    shutil.copy(temp_json_path, json_dest_path)
+                    logger.info(f"💾 Saved metadata JSON to Desktop: {json_dest_path}")
+                
+                # 歌詞とキャプションのテキストファイルをデスクトップに出力
+                lyrics_name = f"Lyrics_{safe_theme}_{timestamp}_{idx+1}.txt"
+                lyrics_path = os.path.join(desktop_dir, lyrics_name)
+                try:
+                    with open(lyrics_path, "w", encoding="utf-8") as f:
+                        f.write("=====================================================\n")
+                        f.write(f"🎵 Auto-Composer: Generated Lyrics & Caption\n")
+                        f.write(f"   Theme: {args.theme}\n")
+                        if actual_duration > 0:
+                            f.write(f"   Target Duration: {actual_duration}s\n")
+                        f.write("=====================================================\n\n")
+                        f.write("■ 歌詞（漢字かな混じり - 通常表示用）\n")
+                        f.write("-----------------------------------------------------\n")
+                        f.write(lyrics)
+                        f.write("\n\n")
+                        f.write("■ 歌詞（ひらがな - ACE-Step 歌唱入力用）\n")
+                        f.write("-----------------------------------------------------\n")
+                        f.write(lyrics_hiragana)
+                        f.write("\n\n")
+                        f.write("■ 音楽構成プロンプト (Music Caption - Ollama Base)\n")
+                        f.write("-----------------------------------------------------\n")
+                        f.write(original_caption if 'original_caption' in locals() else caption)
+                        f.write("\n\n")
+                        f.write("■ ✨ エンハンス済みプロンプト (Enhanced Caption - ACE-Step LM)\n")
+                        f.write("-----------------------------------------------------\n")
+                        f.write(caption)
+                        f.write("\n")
+                    logger.info(f"📝 Saved lyrics text file to Desktop: {lyrics_path}")
+                except Exception as lyrics_err:
+                    logger.warning(f"Failed to write lyrics text file: {str(lyrics_err)}")
+                
+                # 自動でファイルを開いてユーザーに通知
+                try:
+                    import platform
+                    if platform.system() == "Darwin":
+                        # QuickTime Playerを最前面に表示し、自動再生するAppleScript
+                        play_script = (
+                            f"osascript "
+                            f"-e 'tell application \"QuickTime Player\" to activate' "
+                            f"-e 'tell application \"QuickTime Player\" to open POSIX file \"{dest_path}\"' "
+                            f"-e 'tell application \"QuickTime Player\" to play document 1'"
+                        )
+                        os.system(play_script)
+                        if 'lyrics_path' in locals() and os.path.exists(lyrics_path):
+                            os.system(f"open '{lyrics_path}'")
+                except Exception:
+                    pass
+                
+        # クリーニング
+        shutil.rmtree(temp_save_dir, ignore_errors=True)
+    else:
+        logger.error(f"Failed to generate music: {result.status_message}")
+        shutil.rmtree(temp_save_dir, ignore_errors=True)
+        sys.exit(1)
+        
+    logger.info(f"Total time elapsed: {time.time() - t_start:.1f} seconds.")
+
+if __name__ == "__main__":
+    main()

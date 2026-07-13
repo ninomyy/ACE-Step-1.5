@@ -96,6 +96,16 @@ class LLMHandler:
         actually reclaimable.  Supports CUDA, XPU (Intel), and MPS
         (Apple Silicon) backends.
         """
+        if getattr(self, "llm_backend", None) == "mlx":
+            # MLX manages its own Metal memory; calling PyTorch MPS synchronization
+            # here can cause command buffer submission conflicts ('commit an already committed command buffer')
+            try:
+                import mlx.core as mx
+                mx.clear_cache()
+            except Exception:
+                pass
+            return
+
         try:
             active_device = str(getattr(self, "device", "cpu")).split(":")[0]
         except (TypeError, AttributeError):
