@@ -103,7 +103,7 @@ def main():
         use_adg=False,
         sampler_mode="euler",
         shift=3.0,          # SFT必須パラメータ
-        dcw_enabled=False,  # SFT必須パラメータ
+        dcw_enabled=True,   # 修正: SFTでもノイズを防ぐためにDCWを有効化
         seed=seed,          # 全く同じシード値を指定
     )
     

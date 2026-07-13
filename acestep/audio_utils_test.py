@@ -437,5 +437,111 @@ class ApplyFadeTests(unittest.TestCase):
         self.assertAlmostEqual(float(result[0, -1]), 0.0, places=5)
 
 
+class AudioSaverPrecisionAndSafetyTests(unittest.TestCase):
+    """Tests for AudioSaver safety margins, clipping prevention, and formats."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.sample_rate = 48000
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.temp_dir, ignore_errors=True)
+
+    def test_nan_inf_replacement(self):
+        """AudioSaver should replace non-finite values with safe float values."""
+        saver = AudioSaver()
+        output_path = Path(self.temp_dir) / "test_nan.wav"
+        
+        # Audio containing NaN and Inf values
+        audio = torch.tensor([[0.5, float('nan'), -0.5, float('inf'), float('-inf')]])
+        
+        saved_path = saver.save_audio(audio, output_path, sample_rate=self.sample_rate, format="wav", bit_depth=16)
+        
+        import soundfile as sf
+        data, sr = sf.read(saved_path)
+        
+        # Verify the saved data does not contain NaN/Inf
+        self.assertTrue(np.all(np.isfinite(data)))
+        self.assertEqual(sr, self.sample_rate)
+
+    def test_soundfile_clip_prevention(self):
+        """AudioSaver should clip values to [-1.0, 1.0] before writing via soundfile."""
+        saver = AudioSaver()
+        output_path = Path(self.temp_dir) / "test_clip.wav"
+        
+        audio = torch.tensor([[1.5, -2.0, 0.5]])
+        
+        saved_path = saver.save_audio(audio, output_path, sample_rate=self.sample_rate, format="wav", bit_depth=24)
+        
+        import soundfile as sf
+        data, sr = sf.read(saved_path)
+        self.assertTrue(np.all(data <= 1.0))
+        self.assertTrue(np.all(data >= -1.0))
+
+    def test_flac_32bit_fallback(self):
+        """FLAC format with 32-bit depth should fall back to 24-bit PCM."""
+        saver = AudioSaver()
+        output_path = Path(self.temp_dir) / "test_flac_32.flac"
+        audio = torch.tensor([[0.1, -0.1, 0.2]])
+        
+        saved_path = saver.save_audio(audio, output_path, sample_rate=self.sample_rate, format="flac", bit_depth=32)
+        
+        import soundfile as sf
+        info = sf.info(saved_path)
+        self.assertEqual(info.format, "FLAC")
+        self.assertEqual(info.subtype, "PCM_24")
+
+    def test_wav_extension_fix(self):
+        """WAV format with 32-bit depth outputting to .flac path should change extension to .wav."""
+        saver = AudioSaver()
+        output_path = Path(self.temp_dir) / "test_wrong_ext.flac"
+        audio = torch.tensor([[0.1, -0.1, 0.2]])
+        
+        saved_path = saver.save_audio(audio, output_path, sample_rate=self.sample_rate, format="wav32")
+        
+        self.assertTrue(saved_path.endswith(".wav"))
+        self.assertFalse(os.path.exists(output_path))
+        self.assertTrue(os.path.exists(saved_path))
+
+    def test_apply_soft_limiter(self):
+        """apply_soft_limiter should leave values below threshold unchanged and smoothly compress above."""
+        from acestep.audio_utils import apply_soft_limiter
+        
+        # Test values below threshold (0.9)
+        low_audio = torch.tensor([0.0, 0.5, -0.8])
+        limited_low = apply_soft_limiter(low_audio, threshold=0.9)
+        self.assertTrue(torch.allclose(low_audio, limited_low))
+        
+        # Test values above threshold
+        high_audio = torch.tensor([1.2, -2.0, 0.5])
+        limited_high = apply_soft_limiter(high_audio, threshold=0.9)
+        
+        # Values above threshold must be compressed but sign preserved
+        self.assertTrue(limited_high[0] > 0.9)
+        self.assertTrue(limited_high[0] <= 1.0)
+        self.assertTrue(limited_high[1] < -0.9)
+        self.assertTrue(limited_high[1] >= -1.0)
+        # Value below threshold must remain exactly same
+        self.assertEqual(limited_high[2].item(), 0.5)
+
+    def test_wav32_bit_perfect_saving(self):
+        """AudioSaver should save 32-bit float audio without peak normalization or limiting."""
+        saver = AudioSaver()
+        output_path = Path(self.temp_dir) / "test_bit_perfect.wav"
+        
+        audio = torch.tensor([[2.5, -1.8, 0.5]])
+        
+        saved_path = saver.save_audio(audio, output_path, sample_rate=self.sample_rate, format="wav32")
+        
+        import soundfile as sf
+        data, sr = sf.read(saved_path)
+        
+        # Under 32-bit FLOAT WAV, the values should remain exactly as they were (no clipping, no normalization)
+        self.assertAlmostEqual(data[0], 2.5, places=5)
+        self.assertAlmostEqual(data[1], -1.8, places=5)
+        self.assertAlmostEqual(data[2], 0.5, places=5)
+
+
 if __name__ == '__main__':
     unittest.main()

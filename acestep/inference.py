@@ -249,6 +249,7 @@ class GenerationConfig:
     audio_format: str = "flac"  # Default to FLAC for fast saving
     mp3_bitrate: str = "128k"
     mp3_sample_rate: int = 48000
+    bit_depth: int = 16
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert config to dictionary for JSON serialization."""
@@ -1030,7 +1031,8 @@ def generate_music(
                                                         format=audio_format,
                                                         channels_first=True,
                                                         mp3_bitrate=getattr(config, "mp3_bitrate", "128k"),
-                                                        mp3_sample_rate=getattr(config, "mp3_sample_rate", 48000))
+                                                        mp3_sample_rate=getattr(config, "mp3_sample_rate", 48000),
+                                                        bit_depth=getattr(config, "bit_depth", 16))
                 except Exception as e:
                     logger.error(f"[generate_music] Failed to save audio file: {e}")
                     audio_path = ""  # Fallback to empty path

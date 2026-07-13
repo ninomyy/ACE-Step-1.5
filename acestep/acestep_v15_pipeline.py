@@ -39,7 +39,7 @@ for proxy_var in [
     os.environ.pop(proxy_var, None)
 
 # Force torchaudio to use ffmpeg backend (torchcodec not available on XPU/Windows)
-os.environ["TORCHAUDIO_USE_BACKEND"] = "ffmpeg"
+# os.environ["TORCHAUDIO_USE_BACKEND"] = "ffmpeg"
 
 try:
     # When executed as a module: `python -m acestep.acestep_v15_pipeline`

@@ -34,7 +34,7 @@ DEFAULT_MODEL = "qwen3.6:27b"
 
 def parse_lyrics_file(file_path):
     """Parse theme, caption, lyrics, and lyrics_hiragana from a generated lyrics file."""
-    logger.info(f"Reading and parsing existing lyrics file: {file_path}")
+    logger.info(f"既存の歌詞ファイルを読み込んで解析しています: {file_path}")
     with open(file_path, "r", encoding="utf-8") as f:
         content = f.read()
     
@@ -96,7 +96,7 @@ def parse_lyrics_file(file_path):
 
 def get_lyrics_and_caption_from_ollama(theme, duration, model_name=DEFAULT_MODEL):
     """Call Ollama API to generate lyrics and caption based on the theme."""
-    logger.info(f"Generating lyrics, hiragana lyrics, and music caption via Ollama ({model_name})...")
+    logger.info(f"Ollama ({model_name}) を使用して、歌詞、ひらがな歌詞、および音楽構成プロンプトを生成しています...")
     
     if duration == 0:
         duration_instruction = """The target song duration is set to dynamic mode. You MUST write a FULL-LENGTH song (3 to 5 minutes). 
@@ -211,7 +211,7 @@ Response JSON Format:
 
 def unload_ollama_model(model_name=DEFAULT_MODEL):
     """Force unload the model from GPU/Unified Memory immediately by setting keep_alive to 0."""
-    logger.info(f"Releasing model {model_name} from Mac memory...")
+    logger.info(f"Macのメモリからモデル {model_name} を解放しています...")
     try:
         response = requests.post(
             OLLAMA_API_URL,
@@ -224,9 +224,9 @@ def unload_ollama_model(model_name=DEFAULT_MODEL):
             timeout=10
         )
         response.raise_for_status()
-        logger.info("Ollama memory released successfully.")
+        logger.info("Ollamaのメモリ解放が完了しました。")
     except Exception as e:
-        logger.warning(f"Failed to force unload Ollama model: {str(e)}")
+        logger.warning(f"Ollamaモデルの強制アンロードに失敗しました: {str(e)}")
 
 def detect_keyscale(theme, caption):
     """
@@ -387,8 +387,10 @@ def calculate_estimated_duration(lyrics_hiragana):
     
     total_time = instrumental_time + vocal_time + pause_time
     
-    # Constrain to 30s - 360s
-    return max(30, min(total_time, 360))
+    # Constrain to 30s - 210s
+    # 長時間（3分半以上）を一気に生成しようとするとDiTのコンテキスト限界を超えて
+    # 曲の後半で同じ音がループする現象(Repetition Collapse)が起きるため、安全限界(210秒)を設ける
+    return max(30, min(total_time, 210))
 
 def get_total_ram_gb():
     """Check system RAM in GB to determine if parallel model loading is safe."""
@@ -402,25 +404,27 @@ def get_total_ram_gb():
 
 def wait_for_ollama_unload():
     """Poll Ollama API to confirm models are unloaded, eliminating fixed sleep times."""
-    logger.info("Waiting for Ollama to release memory...")
+    logger.info("Ollamaのメモリ解放を待機しています...")
     for _ in range(30):
         try:
             resp = requests.get("http://127.0.0.1:11434/api/ps", timeout=1)
             if resp.status_code == 200:
                 models = resp.json().get("models", [])
                 if len(models) == 0:
-                    logger.info("✅ Ollama memory released instantly.")
+                    logger.info("✅ Ollamaのメモリが即座に解放されました。")
                     return
         except Exception:
             pass
         time.sleep(0.1)
-    logger.warning("Ollama memory release confirmation timeout, proceeding anyway.")
+    logger.warning("Ollamaのメモリ解放の確認がタイムアウトしましたが、このまま続行します。")
 
 def main():
     parser = argparse.ArgumentParser(description="Auto-Compose song using Ollama + ACE-Step 1.5 XL")
     parser.add_argument("--theme", type=str, required=True, help="Theme for the song (in Japanese) or path to an existing Lyrics_*.txt file")
     parser.add_argument("--duration", type=int, default=0, help="Duration of the generated song in seconds (0 = dynamic based on lyrics)")
     parser.add_argument("--format", type=str, default="flac", choices=["flac", "wav", "mp3"], help="Output audio format")
+    parser.add_argument("--bit_depth", type=int, default=16, choices=[16, 24, 32], help="Audio bit depth for WAV/FLAC")
+    parser.add_argument("--model_type", type=str, default="sft", choices=["sft", "turbo"], help="ACE-Step 1.5 model to use")
     parser.add_argument("--ollama_model", type=str, default=DEFAULT_MODEL, help="Ollama model to use")
     
     args = parser.parse_args()
@@ -428,7 +432,7 @@ def main():
     t_start = time.time()
     
     total_ram_gb = get_total_ram_gb()
-    logger.info(f"System RAM detected: {total_ram_gb:.1f} GB")
+    logger.info(f"システムのRAM容量を確認しました: {total_ram_gb:.1f} GB")
     
     # Check if args.theme is a path to an existing lyrics file
     lyrics_file_path = None
@@ -444,8 +448,8 @@ def main():
     if lyrics_file_path:
         # ---- Retry / Re-generation Mode ----
         logger.info("=====================================================")
-        logger.info("🔄 RE-GENERATION MODE: Re-using existing lyrics and caption")
-        logger.info(f"   Source file: {lyrics_file_path}")
+        logger.info("🔄 再生成モード: 既存の歌詞とキャプションを再利用します")
+        logger.info(f"   読み込み元ファイル: {lyrics_file_path}")
         logger.info("=====================================================")
         
         parsed_theme, caption, lyrics, lyrics_hiragana, estimated_duration = parse_lyrics_file(lyrics_file_path)
@@ -453,29 +457,32 @@ def main():
             is_retry = True
             # Override theme to keep the original theme name for file outputs
             args.theme = parsed_theme
-            logger.info(f"Parsed Theme: {args.theme}")
+            logger.info(f"解析されたテーマ: {args.theme}")
             
             # LLMの幻覚（異なるBPMやKeyの出力）をユーザー指定値で強制上書き
             caption = sanitize_caption(args.theme, caption)
             
-            logger.info("Successfully extracted lyrics and caption. Bypassing Ollama generation.")
+            logger.info("歌詞とキャプションの抽出に成功しました。Ollamaでの生成をスキップします。")
         else:
             logger.error("Failed to parse lyrics file contents properly. Falling back to normal mode.")
             
     def init_models():
-        logger.info("Initializing ACE-Step 1.5 XL-turbo DiT handler...")
+        config_path = "acestep-v15-xl-sft" if args.model_type == "sft" else "acestep-v15-xl-turbo"
+        model_display_name = "SFT" if args.model_type == "sft" else "Turbo"
+        
+        logger.info(f"🎵 ACE-Step 1.5 XL {model_display_name} モデルを初期化しています (AIが作曲する準備をしています)...")
         d_handler = AceStepHandler()
         s_msg, s_success = d_handler.initialize_service(
             project_root=str(PROJECT_ROOT),
-            config_path="acestep-v15-xl-sft",
+            config_path=config_path,
             device="auto",
             offload_to_cpu=False,
         )
         if not s_success:
-            logger.error(f"DiT initialization failed: {s_msg}")
+            logger.error(f"作曲AIモデルの初期化に失敗しました: {s_msg}")
             sys.exit(1)
             
-        logger.info("Initializing ACE-Step 1.5 4B Language Model (LM) handler...")
+        logger.info("🧠 ACE-Step 1.5 言語モデル (LM) を初期化しています...")
         l_handler = LLMHandler()
         s_msg, s_success = l_handler.initialize(
             checkpoint_dir=os.path.join(str(PROJECT_ROOT), "checkpoints"),
@@ -497,16 +504,16 @@ def main():
         
         # アルゴリズムで歌詞の文字数とタグから最適な曲の長さを物理計算する（LLMの幻覚を排除）
         estimated_duration = calculate_estimated_duration(lyrics_hiragana)
-        logger.info(f"✨ Calculated optimal duration based on lyrics volume: {estimated_duration}s")
+        logger.info(f"✨ 歌詞の分量から計算された最適な楽曲の長さ: {estimated_duration}秒")
         
         logger.info("\n" + "="*50)
-        logger.info("Generated Music Caption (English):")
+        logger.info("生成された音楽構成プロンプト (英語):")
         logger.info(caption)
         logger.info("-"*50)
-        logger.info("Generated Lyrics (Japanese):")
+        logger.info("生成された歌詞 (日本語):")
         logger.info(lyrics)
         logger.info("-"*50)
-        logger.info("Generated Lyrics Hiragana (For singing):")
+        logger.info("生成された歌唱用ひらがな歌詞:")
         logger.info(lyrics_hiragana)
         logger.info("="*50 + "\n")
         
@@ -519,7 +526,7 @@ def main():
     # ---- 3. ACE-Step 1.5 XL-turbo + 4B LM で作曲とレンダリング ----
     dit_handler, llm_handler = init_models()
         
-    logger.info(f"Rendering song: theme='{args.theme}', duration={args.duration}s, format={args.format}...")
+    logger.info(f"🎼 楽曲のレンダリング（生成）を開始します: テーマ='{args.theme}', 長さ={args.duration}秒, フォーマット={args.format}...")
     
     # Detect keyscale, BPM, and Time Signature from theme or caption
     detected_key = detect_keyscale(args.theme, caption)
@@ -533,34 +540,30 @@ def main():
         fade_out_duration = 8.0  # 8 seconds professional fade-out
         
     if detected_key:
-        logger.info(f"✨ Detected musical keyscale constraint: '{detected_key}'")
+        logger.info(f"✨ 音楽のキー(調)の指定を検出しました: '{detected_key}'")
     else:
-        logger.info("ℹ️ No explicit keyscale constraint found. Using model auto-detection.")
+        logger.info("ℹ️ 明示的なキーの指定はありませんでした。AIの自動判定を使用します。")
         
     if detected_bpm:
-        logger.info(f"✨ Detected BPM constraint: {detected_bpm}")
+        logger.info(f"✨ BPMの指定を検出しました: {detected_bpm}")
     if detected_ts:
-        logger.info(f"✨ Detected Time Signature constraint: '{detected_ts}'")
+        logger.info(f"✨ 拍子の指定を検出しました: '{detected_ts}'")
     if fade_out_duration > 0:
-        logger.info(f"✨ Detected Outro/Fade-out intention. Applying {fade_out_duration}s automatic fade-out mastering.")
+        logger.info(f"✨ アウトロ/フェードアウトの指定を検出しました。{fade_out_duration}秒の自動フェードアウト処理を適用します。")
     
     # 音楽パラメータのチューニング：ACE-Step公式アプリ（Gradio）のデフォルト値に近づけて自然なコード進行を保つ
     # negative_promptはLMに渡すと音楽コードを破壊して不協和音を生む原因になるため削除（デフォルトの "NO USER INPUT" に任せる）
+    # ユーザーが明示的に長さを指定しない限り、AI(LM)の自律的な終了判断に任せる（Playgroundと同じ動作）
+    actual_duration = args.duration if args.duration > 0 else 0
     
-    if args.duration == 0 and estimated_duration > 0:
-        actual_duration = estimated_duration
-        if is_retry:
-            logger.info(f"✨ Using parsed target duration from file: {actual_duration}s")
-        else:
-            logger.info(f"✨ Using calculated optimal duration: {actual_duration}s")
-    elif args.duration == 0:
-        actual_duration = calculate_estimated_duration(lyrics_hiragana)
+    if actual_duration == 0:
+        logger.info("✨ 曲の長さ(Duration)はAIの自律判断(Auto)に委ねます（波状・ループを防止）")
     else:
-        actual_duration = args.duration
+        logger.info(f"✨ 指定された長さを使用します: {actual_duration}秒")
 
 
     # ---- 3.5. Enhance Caption using ACE-Step LM ----
-    logger.info("✨ Enhancing caption using ACE-Step internal LM (Enhance Caption)...")
+    logger.info("✨ ACE-Stepの内部AIを使用してキャプションを強化しています (より良い曲にするための準備)...")
     original_caption = caption
     try:
         user_metadata = {
@@ -576,13 +579,26 @@ def main():
             temperature=0.8,
             use_constrained_decoding=True
         )
-        if format_result and "caption" in format_result and format_result["caption"]:
-            enhanced_caption = format_result["caption"].strip('"\'')
-            if enhanced_caption and enhanced_caption != caption:
-                caption = enhanced_caption
-                logger.info(f"✨ Enhanced Caption: {caption}")
+        if format_result:
+            if "caption" in format_result and format_result["caption"]:
+                enhanced_caption = format_result["caption"].strip('"\'')
+                if enhanced_caption and enhanced_caption != caption:
+                    caption = enhanced_caption
+                    logger.info(f"✨ 強化されたキャプション: {caption}")
+            
+            # エンハンスAIが抽出・整理したメタデータ(BPM/Key)を受け取り、2重指定の矛盾を防ぐために古い情報を上書きする
+            if "bpm" in format_result and format_result["bpm"] not in (None, "", "N/A"):
+                try:
+                    detected_bpm = int(format_result["bpm"])
+                    logger.info(f"✨ エンハンスAIがBPMを最適化しました: {detected_bpm}")
+                except (ValueError, TypeError):
+                    pass
+            
+            if "keyscale" in format_result and format_result["keyscale"] not in (None, "", "N/A"):
+                detected_key = format_result["keyscale"]
+                logger.info(f"✨ エンハンスAIがキーを最適化しました: '{detected_key}'")
     except Exception as e:
-        logger.warning(f"Failed to enhance caption: {e}")
+        logger.warning(f"キャプションの強化に失敗しました: {e}")
 
 
     # ---- 3.6. Model Detection for Parameters ----
@@ -595,17 +611,17 @@ def main():
         inference_steps_val = 8
         shift_val = 1.0
         dcw_val = True
-        logger.info("⚡ Detected Turbo model. Using Turbo parameters (steps=8, shift=1.0, dcw=True)")
+        logger.info("⚡ Turboモデルを検出しました。Turbo用の設定を使用します (steps=8, shift=1.0, dcw=True)")
     elif is_sft:
         inference_steps_val = 50
         shift_val = 3.0
         dcw_val = False
-        logger.info("✨ Detected SFT model. Using SFT parameters (steps=50, shift=3.0, dcw=False)")
+        logger.info("✨ SFTモデルを検出しました。SFT用の設定を使用します (steps=50, shift=3.0, dcw=False)")
     else:
         inference_steps_val = 32
         shift_val = 3.0
         dcw_val = False
-        logger.info("⚙️ Detected Base model. Using Base parameters (steps=32, shift=3.0, dcw=False)")
+        logger.info("⚙️ Baseモデルを検出しました。Base用の設定を使用します (steps=32, shift=3.0, dcw=False)")
 
     params = GenerationParams(
         task_type="text2music",
@@ -631,6 +647,7 @@ def main():
     config = GenerationConfig(
         batch_size=1,
         audio_format=args.format,
+        bit_depth=args.bit_depth,
     )
     
     # Save directly to a temp folder inside gradio_outputs
@@ -649,7 +666,7 @@ def main():
     # ---- 4. ファイルをユーザーのデスクトップへ移動 ----
     desktop_dir = os.path.expanduser("~/Desktop")
     if result.success and result.audios:
-        logger.info("Song generation completed successfully!")
+        logger.info("🎶 楽曲の生成が正常に完了しました！")
         for idx, audio in enumerate(result.audios):
             temp_path = audio.get("path")
             if temp_path and os.path.exists(temp_path):
@@ -661,7 +678,7 @@ def main():
                 
                 # デスクトップにコピー
                 shutil.copy(temp_path, dest_path)
-                logger.info(f"🎉 Saved new track to Desktop: {dest_path}")
+                logger.info(f"🎉 新しい楽曲をデスクトップに保存しました: {dest_path}")
                 
                 # Metadata (JSON) もコピーして、あとでSFTアップスケールに使えるようにする
                 temp_json_path = os.path.splitext(temp_path)[0] + ".json"
@@ -669,7 +686,7 @@ def main():
                 json_dest_path = os.path.join(desktop_dir, json_name)
                 if os.path.exists(temp_json_path):
                     shutil.copy(temp_json_path, json_dest_path)
-                    logger.info(f"💾 Saved metadata JSON to Desktop: {json_dest_path}")
+                    logger.info(f"💾 メタデータ(JSON)をデスクトップに保存しました: {json_dest_path}")
                 
                 # 歌詞とキャプションのテキストファイルをデスクトップに出力
                 lyrics_name = f"Lyrics_{safe_theme}_{timestamp}_{idx+1}.txt"
@@ -698,9 +715,9 @@ def main():
                         f.write("-----------------------------------------------------\n")
                         f.write(caption)
                         f.write("\n")
-                    logger.info(f"📝 Saved lyrics text file to Desktop: {lyrics_path}")
+                    logger.info(f"📝 歌詞のテキストファイルをデスクトップに保存しました: {lyrics_path}")
                 except Exception as lyrics_err:
-                    logger.warning(f"Failed to write lyrics text file: {str(lyrics_err)}")
+                    logger.warning(f"歌詞テキストファイルの保存に失敗しました: {str(lyrics_err)}")
                 
                 # 自動でファイルを開いてユーザーに通知
                 try:
@@ -722,11 +739,11 @@ def main():
         # クリーニング
         shutil.rmtree(temp_save_dir, ignore_errors=True)
     else:
-        logger.error(f"Failed to generate music: {result.status_message}")
+        logger.error(f"楽曲の生成に失敗しました: {result.status_message}")
         shutil.rmtree(temp_save_dir, ignore_errors=True)
         sys.exit(1)
         
-    logger.info(f"Total time elapsed: {time.time() - t_start:.1f} seconds.")
+    logger.info(f"✅ 全ての処理が完了しました。かかった時間: {time.time() - t_start:.1f} 秒")
 
 if __name__ == "__main__":
     main()

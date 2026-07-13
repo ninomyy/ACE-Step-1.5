@@ -110,6 +110,24 @@ def normalize_audio(audio_data: Union[torch.Tensor, np.ndarray], target_db: floa
     return audio
 
 
+def apply_soft_limiter(audio_tensor: torch.Tensor, threshold: float = 0.9) -> torch.Tensor:
+    """Apply a high-quality soft-knee limiter to prevent clipping without affecting linear range.
+    
+    Values below `threshold` are passed unchanged. Values above `threshold` are
+    smoothly compressed toward 1.0 using a tanh-based soft-knee function.
+    """
+    abs_audio = torch.abs(audio_tensor)
+    mask = abs_audio > threshold
+    if not mask.any():
+        return audio_tensor
+        
+    clamped_audio = audio_tensor.clone()
+    scale = 1.0 - threshold
+    # Soft knee curve: threshold + scale * tanh((x - threshold) / scale)
+    compressed = threshold + scale * torch.tanh((abs_audio[mask] - threshold) / scale)
+    clamped_audio[mask] = torch.sign(audio_tensor[mask]) * compressed
+    return clamped_audio
+
 
 class AudioSaver:
     """Audio saving and transcoding utility class"""
@@ -203,6 +221,7 @@ class AudioSaver:
         channels_first: bool = True,
         mp3_bitrate: Optional[str] = None,
         mp3_sample_rate: Optional[int] = None,
+        bit_depth: int = 16,
     ) -> str:
         """
         Save audio data to file
@@ -215,6 +234,7 @@ class AudioSaver:
             channels_first: If True, tensor format is [channels, samples], else [samples, channels]
             mp3_bitrate: Optional MP3 bitrate override (128k/192k/256k/320k)
             mp3_sample_rate: Optional MP3 sample rate override (44100/48000)
+            bit_depth: Audio bit depth (16, 24, 32)
         
         Returns:
             Actual saved file path
@@ -261,6 +281,27 @@ class AudioSaver:
         # Ensure memory is contiguous
         audio_tensor = audio_tensor.contiguous()
         
+        # [Fix for 24-bit/32-bit noise issue]
+        # Replace non-finite values (NaN/Inf) to prevent crash or extreme noise
+        if not torch.isfinite(audio_tensor).all():
+            logger.warning("[AudioSaver] Non-finite values (NaN/Inf) detected in audio tensor. Replacing with safe values.")
+            audio_tensor = torch.nan_to_num(audio_tensor, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        # Determine if the target output uses 32-bit Float
+        is_float_format = (format == "wav32" or bit_depth == 32)
+        
+        # We must avoid forcing WAV 32-bit if the output format is FLAC (which falls back to PCM_24)
+        if format == "flac" and (format == "wav32" or bit_depth == 32):
+            is_float_format = False
+
+        if is_float_format:
+            # 32-bit Float: Keep original dynamic range perfectly, no normalization/limiting needed
+            logger.debug("[AudioSaver] 32-bit Float format detected. Saving raw waveform without dynamic range compression.")
+        else:
+            # 16-bit / 24-bit PCM: Apply high-quality soft limiter to preserve dynamics while preventing hard clipping
+            audio_tensor = apply_soft_limiter(audio_tensor, threshold=0.9)
+
+        
         # Select backend and save
         try:
             if format == "mp3":
@@ -285,11 +326,35 @@ class AudioSaver:
                 # FLAC and WAV use soundfile backend (fastest)
                 try:
                     import soundfile as sf
-                    audio_np = audio_tensor.transpose(0, 1).numpy()
+                    
                     sf_format = "FLAC" if format == "flac" else "WAV"
-                    subtype = "PCM_16"
-                    if format == "wav32":
+                    
+                    # Handle format/bit-depth constraints and fallbacks
+                    if sf_format == "FLAC" and (format == "wav32" or bit_depth == 32):
+                        # FLAC does not support 32-bit float; fallback to 24-bit PCM for FLAC
+                        subtype = "PCM_24"
+                        logger.warning("[AudioSaver] FLAC does not support 32-bit Float. Falling back to 24-bit PCM FLAC.")
+                    elif format == "wav32" or bit_depth == 32:
                         subtype = "FLOAT"
+                        sf_format = "WAV" # Force WAV for 32bit float
+                    elif bit_depth == 24:
+                        subtype = "PCM_24"
+                    else:
+                        subtype = "PCM_16"
+                        
+                    # Explicitly ensure the output extension is correct
+                    if sf_format == "WAV" and output_path.suffix.lower() == ".flac":
+                        output_path = output_path.with_suffix(".wav")
+                        logger.warning(f"[AudioSaver] Formatted output to WAV, renamed file extension to .wav: {output_path}")
+
+                    # MUST ensure contiguous memory layout AFTER transpose, 
+                    # otherwise libsndfile reads F-contiguous memory as C-contiguous, causing extreme noise!
+                    audio_np = np.ascontiguousarray(audio_tensor.transpose(0, 1).numpy())
+                    
+                    if not is_float_format:
+                        # Extra safety hard-clip for PCM formats (in case soft-knee mathematically went epsilon above 1.0)
+                        audio_np = np.clip(audio_np, -1.0, 1.0)
+                    
                     sf.write(str(output_path), audio_np, sample_rate, format=sf_format, subtype=subtype)
                     logger.debug(f"[AudioSaver] Saved audio via soundfile to {output_path} ({format}, {sample_rate}Hz)")
                     return str(output_path)
@@ -306,7 +371,7 @@ class AudioSaver:
                 # Try soundfile fallback for other formats if possible, otherwise use torchaudio
                 try:
                     import soundfile as sf
-                    audio_np = audio_tensor.transpose(0, 1).numpy()
+                    audio_np = np.ascontiguousarray(audio_tensor.transpose(0, 1).numpy())
                     sf_format = format.upper()
                     sf.write(str(output_path), audio_np, sample_rate, format=sf_format)
                     logger.debug(f"[AudioSaver] Saved audio via soundfile to {output_path} ({format}, {sample_rate}Hz)")
@@ -329,7 +394,7 @@ class AudioSaver:
                 raise
             try:
                 import soundfile as sf
-                audio_np = audio_tensor.transpose(0, 1).numpy()  # -> [samples, channels]
+                audio_np = np.ascontiguousarray(audio_tensor.transpose(0, 1).numpy())  # -> [samples, channels]
                 
                 # Handle wav32 fallback formatting
                 if format == "wav32":
@@ -608,6 +673,7 @@ def save_audio(
     channels_first: bool = True,
     mp3_bitrate: Optional[str] = None,
     mp3_sample_rate: Optional[int] = None,
+    bit_depth: int = 16,
 ) -> str:
     """
     Convenience function: save audio (using default configuration)
@@ -632,4 +698,5 @@ def save_audio(
         channels_first,
         mp3_bitrate,
         mp3_sample_rate,
+        bit_depth,
     )
