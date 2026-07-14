@@ -82,13 +82,20 @@ def parse_lyrics_file(file_path):
                 else:
                     lyrics_hira_section = sub_content.strip()
                     
-        if "■ 音楽構成プロンプト (Music Caption)" in content:
-            parts = content.split("■ 音楽構成プロンプト (Music Caption)")
+        if "■ 音楽構成プロンプト" in content:
+            parts = content.split("■ 音楽構成プロンプト")
             if len(parts) > 1:
+                # 最後のセクション（最新のキャプション）を取得。
+                # 過去のファイルには「Ollama Base」と「Enhanced Caption」の2セクションがあるが、
+                # 最初の「Ollama Base」セクションを使いたいので parts[1] を使う。
                 sub_content = parts[1]
                 if "-----------------------------------------------------" in sub_content:
                     sub_content = sub_content.split("-----------------------------------------------------", 1)[1]
-                caption_section = sub_content.strip()
+                # 次のセクション（「■」で始まる行）があればそこで切る
+                if "■" in sub_content:
+                    caption_section = sub_content.split("■", 1)[0].strip()
+                else:
+                    caption_section = sub_content.strip()
     except Exception as parse_err:
         logger.error(f"Error parsing lyrics file sections: {str(parse_err)}")
         
@@ -685,11 +692,7 @@ def main():
                         f.write("-----------------------------------------------------\n")
                         f.write(lyrics_hiragana)
                         f.write("\n\n")
-                        f.write("■ 音楽構成プロンプト (Music Caption - Ollama Base)\n")
-                        f.write("-----------------------------------------------------\n")
-                        f.write(original_caption if 'original_caption' in locals() else caption)
-                        f.write("\n\n")
-                        f.write("■ ✨ エンハンス済みプロンプト (Enhanced Caption - ACE-Step LM)\n")
+                        f.write("■ 音楽構成プロンプト (Music Caption - Ollama Direct)\n")
                         f.write("-----------------------------------------------------\n")
                         f.write(caption)
                         f.write("\n")
