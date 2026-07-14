@@ -125,15 +125,15 @@ Theme: {theme}
 {duration_instruction}
 
 Rules:
-1. For [Music Caption], write in English. It MUST include specific technical tags to ensure highest musical quality:
+1. For [Music Caption], write in English. To prevent AI prompt overload, keep it concise (maximum 30-50 words, using 5-8 comma-separated tags). It MUST include specific technical tags to ensure highest musical quality:
    - "studio quality, high-fidelity, pristine audio, professional mixing, 48kHz, lossless"
    - Specify vocal style clearly (e.g., "breathy whisper voice", "emotional falsetto", "powerful belting", "clear female vocal").
    - CRITICAL: If the user specifies a BPM, Key, or Time Signature in the Theme, you MUST use those EXACT values in the English caption. DO NOT change them.
-   - Describe the genre (City Pop) and instruments (synthesizers, grooving bass, brass). 
+   - Describe the genre (City Pop) and instruments. Limit instrument specification to 1-2 main instruments (e.g., "piano, grooving bass") to avoid oversaturation.
    - Crucially, analyze the theme and determine the ending style. Describe this chosen ending clearly in English at the end of the [Music Caption] (e.g., "ends with a smooth 15-second instrumental fade-out" or "concludes with a clean, dramatic final piano chord").
 2. For [Lyrics], write in Japanese (Kanji/Kana mix). To achieve a dramatic J-Pop/City Pop structure, use THESE specific structural tags in square brackets:
    [Intro], [Verse 1], [Pre-Chorus], [Chorus], [Instrumental Break], [Quiet Chorus], [Final Chorus], [Outro].
-   Ensure the lyrics are poetic, rhythmic, and fit the city pop melody.
+   You may optionally add brief stylistic or instrumental cues inside the tags (e.g., [Chorus: energetic brass]) to dynamically change the mood, but keep them musical and effective. Ensure the lyrics are poetic, rhythmic, and fit the city pop melody.
 3. For [Lyrics Hiragana], write the EXACT SAME lyrics as in Rule 2, but converted entirely into Hiragana (ひらがな) and Katakana (for loan words) to prevent the vocal synthesis model from mispronouncing the words.
    - Do NOT convert the structural tags (like [Intro], [Chorus]) into hiragana—keep them in English brackets.
    - Crucially, verify all Japanese dictionary readings for absolute correctness and avoid common pronunciation/spelling traps:
@@ -562,43 +562,15 @@ def main():
         logger.info(f"✨ 指定された長さを使用します: {actual_duration}秒")
 
 
-    # ---- 3.5. Enhance Caption using ACE-Step LM ----
-    logger.info("✨ ACE-Stepの内部AIを使用してキャプションを強化しています (より良い曲にするための準備)...")
-    original_caption = caption
-    try:
-        user_metadata = {
-            "bpm": detected_bpm,
-            "keyscale": detected_key,
-            "timesignature": detected_ts,
-            "vocal_language": "ja"
-        }
-        format_result, _ = llm_handler.format_sample_from_input(
-            caption=caption,
-            lyrics=lyrics_hiragana,
-            user_metadata=user_metadata,
-            temperature=0.8,
-            use_constrained_decoding=True
-        )
-        if format_result:
-            if "caption" in format_result and format_result["caption"]:
-                enhanced_caption = format_result["caption"].strip('"\'')
-                if enhanced_caption and enhanced_caption != caption:
-                    caption = enhanced_caption
-                    logger.info(f"✨ 強化されたキャプション: {caption}")
-            
-            # エンハンスAIが抽出・整理したメタデータ(BPM/Key)を受け取り、2重指定の矛盾を防ぐために古い情報を上書きする
-            if "bpm" in format_result and format_result["bpm"] not in (None, "", "N/A"):
-                try:
-                    detected_bpm = int(format_result["bpm"])
-                    logger.info(f"✨ エンハンスAIがBPMを最適化しました: {detected_bpm}")
-                except (ValueError, TypeError):
-                    pass
-            
-            if "keyscale" in format_result and format_result["keyscale"] not in (None, "", "N/A"):
-                detected_key = format_result["keyscale"]
-                logger.info(f"✨ エンハンスAIがキーを最適化しました: '{detected_key}'")
-    except Exception as e:
-        logger.warning(f"キャプションの強化に失敗しました: {e}")
+    # ---- 3.5. Enhance Caption — BYPASSED ----
+    # エンハンスAI（ACE-Step内部LM）はバイパスします。
+    # 理由: Ollamaが生成した短く的確なプロンプトに対し、エンハンスAIが毎回
+    # 「synth pads」「lingering chord」等の持続音を誘発するキーワードを勝手に追加し、
+    # SFTモデルのD#持続バグの主要原因となっていたため。
+    # OllamaのプロンプトはアプローチE（30-50語制限）で既に最適化されているため、
+    # エンハンスなしでPlaygroundと同等の品質が得られます。
+    logger.info("✨ Ollamaが生成したキャプションをそのまま使用します（エンハンスAIはバイパス）")
+    logger.info(f"✨ キャプション: {caption}")
 
 
     # ---- 3.6. Model Detection for Parameters ----
@@ -611,17 +583,23 @@ def main():
         inference_steps_val = 8
         shift_val = 1.0
         dcw_val = True
+        guidance_scale_val = 7.0
+        use_adg_val = False
         logger.info("⚡ Turboモデルを検出しました。Turbo用の設定を使用します (steps=8, shift=1.0, dcw=True)")
     elif is_sft:
         inference_steps_val = 50
         shift_val = 3.0
         dcw_val = False
-        logger.info("✨ SFTモデルを検出しました。SFT用の設定を使用します (steps=50, shift=3.0, dcw=False)")
+        guidance_scale_val = 7.0  # Playgroundデフォルトに合わせる（Ollamaのプロンプトは既に短く制御済み）
+        use_adg_val = False       # Playgroundデフォルト。ADGのangle_clipがコード進行の変化を鈍くする副作用を回避
+        logger.info("✨ SFTモデルを検出しました。Playground準拠の設定を使用します (steps=50, shift=3.0, guidance=7.0, adg=False)")
     else:
         inference_steps_val = 32
         shift_val = 3.0
         dcw_val = False
-        logger.info("⚙️ Baseモデルを検出しました。Base用の設定を使用します (steps=32, shift=3.0, dcw=False)")
+        guidance_scale_val = 5.0
+        use_adg_val = False
+        logger.info("⚙️ Baseモデルを検出しました。Base用の設定を使用します (steps=32, shift=3.0, guidance=5.0)")
 
     params = GenerationParams(
         task_type="text2music",
@@ -635,8 +613,8 @@ def main():
         timesignature=detected_ts,
         fade_out_duration=fade_out_duration,
         inference_steps=inference_steps_val,
-        guidance_scale=7.0, # 最も安定した黄金比（7.0）に戻す
-        use_adg=False,      # 音楽構造の崩壊を防ぐためADGはオフ
+        guidance_scale=guidance_scale_val,
+        use_adg=use_adg_val,
         sampler_mode="euler",# 安定・高速な標準サンプラーに戻す
         lm_temperature=0.8, # LMの温度を下げて、王道で破綻のないコード進行を生成させる
         shift=shift_val,
