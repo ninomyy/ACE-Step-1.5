@@ -32,6 +32,73 @@ from acestep.inference import GenerationParams, GenerationConfig, generate_music
 OLLAMA_API_URL = "http://127.0.0.1:11434/api/generate"
 DEFAULT_MODEL = "qwen3.6:27b"
 
+import re
+
+def convert_to_hiragana_mecab(text):
+    """MeCabを用いて漢字かな混じり文を確実なひらがなに変換する"""
+    import MeCab
+    try:
+        import unidic_lite
+        tagger = MeCab.Tagger(f'-d "{unidic_lite.DICDIR}"')
+    except ImportError:
+        tagger = MeCab.Tagger()
+        
+    lines = text.splitlines()
+    hiragana_lines = []
+    
+    for line in lines:
+        if not line.strip():
+            hiragana_lines.append("")
+            continue
+            
+        result = ""
+        node = tagger.parseToNode(line)
+        while node:
+            if node.surface:
+                # 漢字が含まれているかチェック
+                if re.search(r'[一-龥]', node.surface):
+                    features = node.feature.split(",")
+                    # unidic-lite では index 9 が発音(カタカナ)
+                    if len(features) >= 10 and features[9] != "*" and features[9] != "":
+                        yomi = features[9]
+                    elif len(features) >= 8 and features[7] != "*" and features[7] != "":
+                        yomi = features[7]
+                    else:
+                        yomi = node.surface
+                    result += yomi
+                else:
+                    # 漢字以外（ひらがな、英語、記号、タグ等）はそのまま
+                    result += node.surface
+            node = node.next
+
+        # 全角カタカナのみをひらがなに変換 (ASCII英数字や記号は無傷)
+        h_line = "".join([chr(ord(c) - 96) if 0x30A1 <= ord(c) <= 0x30F6 else c for c in result])
+        
+        # 助詞の強制変換（Ollamaと同等の発音ルール）
+        h_line = h_line.replace("は", "わ").replace("へ", "え").replace("を", "お")
+        hiragana_lines.append(h_line)
+        
+    return "\n".join(hiragana_lines)
+
+def convert_hiragana_to_romaji(text):
+    """決定されたひらがなからローマ字を再構築する（pykakasi使用）"""
+    import pykakasi
+    kks = pykakasi.kakasi()
+    lines = text.splitlines()
+    romaji_lines = []
+    
+    for line in lines:
+        result = kks.convert(line)
+        romaji_line = ""
+        for item in result:
+            # 英語や記号はそのまま、ひらがなはヘボン式ローマ字にしてスペースを空ける
+            romaji_line += item['hepburn'] + " "
+        # 各行ごとに前後の不要なスペースをクリーニング
+        romaji_lines.append(romaji_line.strip())
+        
+    return "\n".join(romaji_lines)
+
+
 def parse_lyrics_file(file_path):
     """Parse theme, caption, lyrics, and lyrics_hiragana from a generated lyrics file."""
     logger.info(f"既存の歌詞ファイルを読み込んで解析しています: {file_path}")
@@ -143,6 +210,12 @@ Rules:
    You may optionally add brief stylistic or instrumental cues inside the tags (e.g., [Chorus: energetic brass]) to dynamically change the mood, but keep them musical and effective. Ensure the lyrics are poetic, rhythmic, and fit the city pop melody.
 3. For [Lyrics Hiragana], write the EXACT SAME lyrics as in Rule 2, but converted entirely into Hiragana (ひらがな) and Katakana (for loan words) to prevent the vocal synthesis model from mispronouncing the words.
    - Do NOT convert the structural tags (like [Intro], [Chorus]) into hiragana—keep them in English brackets.
+   - VERY IMPORTANT for vocal synthesis: You MUST convert Japanese grammatical particles to their phonetic pronunciations:
+     * The particle "は" (ha) MUST be written as "わ" (wa). (e.g., わたしは -> わたしわ)
+     * The particle "へ" (he) MUST be written as "え" (e). (e.g., どこへ -> どこえ)
+     * The particle "を" (wo) MUST be written as "お" (o). (e.g., そらを -> そらお)
+   - WARNING: Do NOT convert these characters if they are part of a word (e.g., "歩幅" must be "ほはば", not "ほわば").
+   - CRITICAL for English: Do NOT convert English words into Katakana or Hiragana. Keep them in the original English alphabet so the AI can sing with native pronunciation (e.g., "Love" must remain "Love"). Convert only numbers (e.g., "1" -> "いち").
    - Crucially, verify all Japanese dictionary readings for absolute correctness and avoid common pronunciation/spelling traps:
      * "遠く" must be spelled as "とおく" (NOT "とうく")
      * "通り" must be spelled as "とおり" (NOT "とうり")
@@ -152,13 +225,14 @@ Rules:
      * "静けさ" must be read as "しずけさ" (NOT "しずかさ")
      * "耳を澄ませて" must be read as "みみをすませて" (do not omit "み")
    - Double check that the Hiragana version matches the Kanji/Kana mixed version syllable-by-syllable without omitting any words or characters.
-4. You are allowed to output your thought process or reasoning before the JSON. Take your time to carefully write out a full 3 to 5-minute song. After your reasoning, you MUST output a JSON block containing three keys: "caption", "lyrics", and "lyrics_hiragana".
+4. You are allowed to output your thought process or reasoning before the JSON. Take your time to carefully write out a full 3 to 5-minute song. After your reasoning, you MUST output a JSON block containing four keys: "caption", "lyrics", "lyrics_hiragana", and "lyrics_romaji".
 
 Response JSON Format:
 {{
   "caption": "(English caption here)",
   "lyrics": "(Japanese lyrics in Kanji/Kana mix here)",
-  "lyrics_hiragana": "(Japanese lyrics in Hiragana/Katakana here)"
+  "lyrics_hiragana": "(Japanese lyrics entirely in Hiragana/Katakana here, keeping English words)",
+  "lyrics_romaji": "(Japanese lyrics entirely in Romaji separated by spaces here, keeping English words)"
 }}
 """
 
@@ -202,11 +276,12 @@ Response JSON Format:
         caption = parsed.get("caption", "").strip()
         lyrics = parsed.get("lyrics", "").strip()
         lyrics_hiragana = parsed.get("lyrics_hiragana", "").strip()
+        lyrics_romaji = parsed.get("lyrics_romaji", "").strip()
         
-        if not caption or not lyrics or not lyrics_hiragana:
-            raise ValueError("Ollama returned empty caption, lyrics, or lyrics_hiragana.")
+        if not caption or not lyrics or not lyrics_hiragana or not lyrics_romaji:
+            raise ValueError("Ollama returned empty fields.")
             
-        return caption, lyrics, lyrics_hiragana
+        return caption, lyrics, lyrics_hiragana, lyrics_romaji
     except Exception as e:
         logger.error(f"Error calling Ollama: {str(e)}")
         # Fallback prompts if Ollama fails
@@ -214,7 +289,8 @@ Response JSON Format:
         caption = "A beautiful and melodic Japanese city pop song, clear and emotional female vocal, retro synthesizer chords, grooving bassline, nostalgic 80s urban atmosphere, ending with a smooth instrumental fade-out. Sung in Japanese, high quality, 110 BPM, key of A major."
         lyrics = "[Intro]\n[Verse 1]\nビルが立ち並ぶ 街 of ネオン\n君の影を 探しているの\n[Chorus]\n真夜中のハイウェイ 走り抜け\n二人だけの世界へ 連れてって\n踊ろうよ 朝が来るまで\n[Outro]"
         lyrics_hiragana = "[Intro]\n[Verse 1]\nびるがたちならぶ まちのねおん\nきみのかげを ささがしているの\n[Chorus]\nまよなかのはいうぇい はしりぬけ\nふたりだけのせかいへ つれてって\nおどろうよ あさがくるまで\n[Outro]"
-        return caption, lyrics, lyrics_hiragana
+        lyrics_romaji = "[Intro]\n[Verse 1]\nbiru ga tachinarabu machi no neon\nkimi no kage o sagashite iru no\n[Chorus]\nmayonaka no haiwei hashirinuke\nfutari dake no sekai e tsuretette\nodorou yo asa ga kuru made\n[Outro]"
+        return caption, lyrics, lyrics_hiragana, lyrics_romaji
 
 def unload_ollama_model(model_name=DEFAULT_MODEL):
     """Force unload the model from GPU/Unified Memory immediately by setting keep_alive to 0."""
@@ -433,6 +509,7 @@ def main():
     parser.add_argument("--bit_depth", type=int, default=16, choices=[16, 24, 32], help="Audio bit depth for WAV/FLAC")
     parser.add_argument("--model_type", type=str, default="sft", choices=["sft", "turbo"], help="ACE-Step 1.5 model to use")
     parser.add_argument("--ollama_model", type=str, default=DEFAULT_MODEL, help="Ollama model to use")
+    parser.add_argument("--action_mode", type=str, default="new", choices=["new", "reproduce", "random"], help="Action mode for generation")
     
     args = parser.parse_args()
     
@@ -451,11 +528,20 @@ def main():
         if os.path.exists(desktop_path) and args.theme.endswith(".txt"):
             lyrics_file_path = desktop_path
             
+    # -- Action Mode Validation --
+    if args.action_mode in ["reproduce", "random"]:
+        if not lyrics_file_path:
+            logger.error(f"❌ エラー: {args.action_mode} モードが選択されましたが、song_theme.txt に有効な歌詞ファイル (Lyrics_○○.txt) のパスが指定されていません。")
+            logger.error("処理を中断します。デスクトップの song_theme.txt を修正してから再度お試しください。")
+            sys.exit(1)
+            
     is_retry = False
-    if lyrics_file_path:
+    target_seed = -1
+    
+    if lyrics_file_path and args.action_mode in ["reproduce", "random"]:
         # ---- Retry / Re-generation Mode ----
         logger.info("=====================================================")
-        logger.info("🔄 再生成モード: 既存の歌詞とキャプションを再利用します")
+        logger.info(f"🔄 再生成モード ({args.action_mode}): 既存の歌詞とキャプションを再利用します")
         logger.info(f"   読み込み元ファイル: {lyrics_file_path}")
         logger.info("=====================================================")
         
@@ -470,6 +556,38 @@ def main():
             caption = sanitize_caption(args.theme, caption)
             
             logger.info("歌詞とキャプションの抽出に成功しました。Ollamaでの生成をスキップします。")
+            
+            # メロディー再現モードの場合は前回のSeedを取得
+            if args.action_mode == "reproduce":
+                try:
+                    base_name = os.path.basename(lyrics_file_path)
+                    json_name = base_name.replace("Lyrics_", "Song_").replace(".txt", ".json")
+                    json_path = os.path.join(os.path.dirname(lyrics_file_path), json_name)
+                    
+                    if os.path.exists(json_path):
+                        with open(json_path, "r", encoding="utf-8") as jf:
+                            meta = json.load(jf)
+                            # JSON内からシードを探す
+                            found_seed = None
+                            if "seed" in meta:
+                                found_seed = meta["seed"]
+                            elif "inference_params" in meta and "seed" in meta["inference_params"]:
+                                found_seed = meta["inference_params"]["seed"]
+                            elif "params" in meta and "seed" in meta["params"]:
+                                found_seed = meta["params"]["seed"]
+                            elif "inference_kwargs" in meta and "seed" in meta["inference_kwargs"]:
+                                found_seed = meta["inference_kwargs"]["seed"]
+                                
+                            if found_seed is not None:
+                                target_seed = int(found_seed)
+                                logger.info(f"✨ 前回のメタデータを発見しました。メロディー再現のため Seed を固定します: {target_seed}")
+                            else:
+                                logger.warning(f"⚠️ メタデータ内にシード値が見つかりません。ランダムなメロディーになります。")
+                    else:
+                        logger.warning(f"⚠️ メタデータが見つかりません: {json_path}")
+                        logger.warning("シード値が復元できないため、ランダムなメロディーになります。")
+                except Exception as e:
+                    logger.warning(f"Seed抽出中にエラーが発生しました: {e}")
         else:
             logger.error("Failed to parse lyrics file contents properly. Falling back to normal mode.")
             
@@ -504,7 +622,7 @@ def main():
 
     if not is_retry:
         # ---- 1. Run Ollama 作詞 & プロンプト生成 ----
-        caption, lyrics, lyrics_hiragana = get_lyrics_and_caption_from_ollama(args.theme, args.duration, args.ollama_model)
+        caption, lyrics, lyrics_hiragana, lyrics_romaji = get_lyrics_and_caption_from_ollama(args.theme, args.duration, args.ollama_model)
         
         # LLMの幻覚（異なるBPMやKeyの出力）をユーザー指定値で強制上書き
         caption = sanitize_caption(args.theme, caption)
@@ -522,9 +640,128 @@ def main():
         logger.info("-"*50)
         logger.info("生成された歌唱用ひらがな歌詞:")
         logger.info(lyrics_hiragana)
+        logger.info("-"*50)
+        logger.info("生成された歌唱用ローマ字歌詞:")
+        logger.info(lyrics_romaji)
+        # ---- 2. 読み仮名「ダブルチェック」ロジック（ブロック単位比較） ----
+        logger.info("🔍 MeCab(最強辞書) を用いてAIのフリガナのダブルチェックを行います...")
+        mecab_hiragana = convert_to_hiragana_mecab(lyrics)
+        
+        orig_lines = lyrics.splitlines()
+        ollama_lines = lyrics_hiragana.splitlines()
+        mecab_lines = mecab_hiragana.splitlines()
+        
+        # 安全のため、行数が合わない場合は全文比較フォールバック
+        if len(orig_lines) != len(ollama_lines) or len(ollama_lines) != len(mecab_lines):
+            logger.warning("⚠️ 予期せぬ行数不一致が発生しました。全文で比較します。")
+            print(f"\n--- Ollama(AI) ---\n{lyrics_hiragana}\n")
+            print(f"--- MeCab(辞書) ---\n{mecab_hiragana}\n")
+            choice = input("どちらを採用しますか？ [1:Ollama / 2:MeCab]: ").strip()
+            final_hiragana = lyrics_hiragana if choice == "1" else mecab_hiragana
+        else:
+            blocks = []
+            current_block = {"name": "Intro/Unknown", "orig": [], "ollama": [], "mecab": [], "diff": False}
+            
+            for i in range(len(orig_lines)):
+                o_str = orig_lines[i]
+                h_str = ollama_lines[i]
+                m_str = mecab_lines[i]
+                
+                # 構造タグ（[Verse]など）で新しいブロックを開始
+                if o_str.strip().startswith("[") and o_str.strip().endswith("]"):
+                    if current_block["orig"]: 
+                        blocks.append(current_block)
+                    current_block = {"name": o_str.strip(), "orig": [o_str], "ollama": [h_str], "mecab": [m_str], "diff": False}
+                else:
+                    current_block["orig"].append(o_str)
+                    current_block["ollama"].append(h_str)
+                    current_block["mecab"].append(m_str)
+                    # 構造タグ以外の行で違いがあればフラグを立てる
+                    if h_str.strip() != m_str.strip() and h_str.strip() != "" and m_str.strip() != "":
+                        current_block["diff"] = True
+            
+            if current_block["orig"]:
+                blocks.append(current_block)
+                
+            final_hiragana_lines = []
+            
+            # ブロックごとに処理
+            for block in blocks:
+                if block["diff"]:
+                    logger.warning(f"\n⚠️ {block['name']} ブロックの読みに意見割れがあります！")
+                    print("--- 原文 ---")
+                    print("\n".join(block["orig"]))
+                    print("\n--- 1 (AI: Ollama) ---")
+                    print("\n".join(block["ollama"]))
+                    print("\n--- 2 (辞書: MeCab) ---")
+                    print("\n".join(block["mecab"]))
+                    
+                    while True:
+                        choice = input("\nどちらを採用しますか？ [1:丸ごとAI / 2:丸ごと辞書 / 3:1行ずつ選ぶ]: ").strip()
+                        # 全角数字「１」「２」「３」を半角に変換するサポート
+                        choice = choice.replace("１", "1").replace("２", "2").replace("３", "3")
+                        
+                        if choice == "1":
+                            final_hiragana_lines.extend(block["ollama"])
+                            break
+                        elif choice == "2":
+                            final_hiragana_lines.extend(block["mecab"])
+                            break
+                        elif choice == "3":
+                            print(f"\n🔧 1行ずつ選択します。")
+                            for i in range(len(block["orig"])):
+                                o_str = block["orig"][i]
+                                h_str = block["ollama"][i]
+                                m_str = block["mecab"][i]
+                                
+                                # 構造タグのみの行はスキップ
+                                if o_str.strip().startswith("[") and o_str.strip().endswith("]"):
+                                    final_hiragana_lines.append(h_str)
+                                    continue
+                                
+                                # 違いがある行だけプロンプトを出す
+                                if h_str.strip() != m_str.strip() and h_str.strip() != "" and m_str.strip() != "":
+                                    print(f"\n⚠️ {i+1}行目の意見割れ")
+                                    print(f"原文      : {o_str}")
+                                    print(f"1(Ollama) : {h_str}")
+                                    print(f"2(MeCab)  : {m_str}")
+                                    while True:
+                                        sub_choice = input("どちらを採用しますか？ [1 / 2 / 手動で直接入力]: ").strip()
+                                        sub_choice = sub_choice.replace("１", "1").replace("２", "2")
+                                        if sub_choice == "1":
+                                            final_hiragana_lines.append(h_str)
+                                            break
+                                        elif sub_choice == "2":
+                                            final_hiragana_lines.append(m_str)
+                                            break
+                                        elif sub_choice != "":
+                                            final_hiragana_lines.append(sub_choice)
+                                            break
+                                        else:
+                                            # 空入力はデフォルトでOllama
+                                            final_hiragana_lines.append(h_str)
+                                            break
+                                else:
+                                    # 違いがない行はOllama（MeCabと一致しているのでどちらでも同じ）
+                                    final_hiragana_lines.append(h_str)
+                            break
+                        else:
+                            print("1 か 2 か 3 を入力してください。")
+                else:
+                    # 違いがなければそのまま（デフォルトはOllama）
+                    final_hiragana_lines.extend(block["ollama"])
+                    
+            final_hiragana = "\n".join(final_hiragana_lines)
+            
+        lyrics_hiragana = final_hiragana
+        
+        # 決定された正しいひらがなを用いて、ローマ字版を安全に再構築
+        logger.info("✨ 確定したひらがなからローマ字版の歌詞を再構築しています...")
+        lyrics_romaji = convert_hiragana_to_romaji(lyrics_hiragana)
+        
         logger.info("="*50 + "\n")
         
-        # ---- 2. Ollamaのメモリを即座に解放 (アンロードハック) ----
+        # ---- 3. Ollamaのメモリを即座に解放 (アンロードハック) ----
         unload_ollama_model(args.ollama_model)
         
         # フラグ立てと同義の即時ポーリングで待ち時間を最小化
@@ -588,11 +825,11 @@ def main():
     # SFTの場合は高解像度用パラメータ、Turboの場合は高速用パラメータを設定
     if is_turbo:
         inference_steps_val = 8
-        shift_val = 1.0
+        shift_val = 3.0  # Playgroundデフォルトに合わせる（1.0だとボーカルが不鮮明になる）
         dcw_val = True
-        guidance_scale_val = 7.0
+        guidance_scale_val = 7.0  # Turboモデル内部で自動的に1.0に上書きされる（無害）
         use_adg_val = False
-        logger.info("⚡ Turboモデルを検出しました。Turbo用の設定を使用します (steps=8, shift=1.0, dcw=True)")
+        logger.info("⚡ Turboモデルを検出しました。Playground準拠の設定を使用します (steps=8, shift=3.0, dcw=True)")
     elif is_sft:
         inference_steps_val = 50
         shift_val = 3.0
@@ -608,122 +845,135 @@ def main():
         use_adg_val = False
         logger.info("⚙️ Baseモデルを検出しました。Base用の設定を使用します (steps=32, shift=3.0, guidance=5.0)")
 
-    params = GenerationParams(
-        task_type="text2music",
-        thinking=True,
-        caption=caption,
-        lyrics=lyrics_hiragana, # ひらがな歌詞をACE-Stepに渡して歌唱発音ミスを防ぐ
-        vocal_language="ja",
-        duration=actual_duration,
-        keyscale=detected_key,
-        bpm=detected_bpm,
-        timesignature=detected_ts,
-        fade_out_duration=fade_out_duration,
-        inference_steps=inference_steps_val,
-        guidance_scale=guidance_scale_val,
-        use_adg=use_adg_val,
-        sampler_mode="euler",# 安定・高速な標準サンプラーに戻す
-        lm_temperature=0.8, # LMの温度を下げて、王道で破綻のないコード進行を生成させる
-        shift=shift_val,
-        dcw_enabled=dcw_val,
-        seed=-1,
-    )
-    
-    config = GenerationConfig(
-        batch_size=1,
-        audio_format=args.format,
-        bit_depth=args.bit_depth,
-    )
+    import random
+    shared_seed = target_seed if target_seed is not None else random.randint(0, 2**32 - 1)
     
     # Save directly to a temp folder inside gradio_outputs
     temp_save_dir = os.path.join(str(PROJECT_ROOT), "gradio_outputs", "autochord_temp")
     os.makedirs(temp_save_dir, exist_ok=True)
     
-    # Compose
-    result = generate_music(
-        dit_handler,
-        llm_handler,
-        params=params,
-        config=config,
-        save_dir=temp_save_dir,
-    )
-    
-    # ---- 4. ファイルをユーザーのデスクトップへ移動 ----
-    desktop_dir = os.path.expanduser("~/Desktop")
-    if result.success and result.audios:
-        logger.info("🎶 楽曲の生成が正常に完了しました！")
-        for idx, audio in enumerate(result.audios):
-            temp_path = audio.get("path")
-            if temp_path and os.path.exists(temp_path):
-                # 新しいファイル名を作成
-                safe_theme = "".join([c for c in args.theme if c.isalnum() or c in " -_"])[:30]
-                timestamp = int(time.time())
-                final_name = f"Song_{safe_theme}_{timestamp}_{idx+1}.{args.format}"
-                dest_path = os.path.join(desktop_dir, final_name)
-                
-                # デスクトップにコピー
-                shutil.copy(temp_path, dest_path)
-                logger.info(f"🎉 新しい楽曲をデスクトップに保存しました: {dest_path}")
-                
-                # Metadata (JSON) もコピーして、あとでSFTアップスケールに使えるようにする
-                temp_json_path = os.path.splitext(temp_path)[0] + ".json"
-                json_name = f"Song_{safe_theme}_{timestamp}_{idx+1}.json"
-                json_dest_path = os.path.join(desktop_dir, json_name)
-                if os.path.exists(temp_json_path):
-                    shutil.copy(temp_json_path, json_dest_path)
-                    logger.info(f"💾 メタデータ(JSON)をデスクトップに保存しました: {json_dest_path}")
-                
-                # 歌詞とキャプションのテキストファイルをデスクトップに出力
-                lyrics_name = f"Lyrics_{safe_theme}_{timestamp}_{idx+1}.txt"
-                lyrics_path = os.path.join(desktop_dir, lyrics_name)
-                try:
-                    with open(lyrics_path, "w", encoding="utf-8") as f:
-                        f.write("=====================================================\n")
-                        f.write(f"🎵 Auto-Composer: Generated Lyrics & Caption\n")
-                        f.write(f"   Theme: {args.theme}\n")
-                        if actual_duration > 0:
-                            f.write(f"   Target Duration: {actual_duration}s\n")
-                        f.write("=====================================================\n\n")
-                        f.write("■ 歌詞（漢字かな混じり - 通常表示用）\n")
-                        f.write("-----------------------------------------------------\n")
-                        f.write(lyrics)
-                        f.write("\n\n")
-                        f.write("■ 歌詞（ひらがな - ACE-Step 歌唱入力用）\n")
-                        f.write("-----------------------------------------------------\n")
-                        f.write(lyrics_hiragana)
-                        f.write("\n\n")
-                        f.write("■ 音楽構成プロンプト (Music Caption - Ollama Direct)\n")
-                        f.write("-----------------------------------------------------\n")
-                        f.write(caption)
-                        f.write("\n")
-                    logger.info(f"📝 歌詞のテキストファイルをデスクトップに保存しました: {lyrics_path}")
-                except Exception as lyrics_err:
-                    logger.warning(f"歌詞テキストファイルの保存に失敗しました: {str(lyrics_err)}")
-                
-                # 自動でファイルを開いてユーザーに通知
-                try:
-                    import platform
-                    if platform.system() == "Darwin":
-                        # QuickTime Playerを最前面に表示し、自動再生するAppleScript
-                        play_script = (
-                            f"osascript "
-                            f"-e 'tell application \"QuickTime Player\" to activate' "
-                            f"-e 'tell application \"QuickTime Player\" to open POSIX file \"{dest_path}\"' "
-                            f"-e 'tell application \"QuickTime Player\" to play document 1'"
-                        )
-                        os.system(play_script)
-                        if 'lyrics_path' in locals() and os.path.exists(lyrics_path):
-                            os.system(f"open '{lyrics_path}'")
-                except Exception:
-                    pass
-                
-        # クリーニング
-        shutil.rmtree(temp_save_dir, ignore_errors=True)
+    if is_retry:
+        # 再生成モードの場合は受け取った歌詞のみ使用
+        versions = [("retry", lyrics_hiragana)]
     else:
-        logger.error(f"楽曲の生成に失敗しました: {result.status_message}")
-        shutil.rmtree(temp_save_dir, ignore_errors=True)
-        sys.exit(1)
+        # 新曲モードの場合は A/Bテスト（ひらがな版・ローマ字版）の2曲を連続生成
+        versions = [("hiragana", lyrics_hiragana), ("romaji", lyrics_romaji)]
+    
+    for v_idx, (version_name, target_lyrics) in enumerate(versions):
+        if not is_retry:
+            logger.info(f"\n🚀 【A/Bテスト】バージョン '{version_name}' の生成を開始します (シード値固定: {shared_seed})")
+            
+        params = GenerationParams(
+            task_type="text2music",
+            thinking=True,
+            caption=caption,
+            lyrics=target_lyrics, # ひらがな or ローマ字
+            vocal_language="ja",
+            duration=actual_duration,
+            keyscale=detected_key,
+            bpm=detected_bpm,
+            timesignature=detected_ts,
+            fade_out_duration=fade_out_duration,
+            inference_steps=inference_steps_val,
+            guidance_scale=guidance_scale_val,
+            use_adg=use_adg_val,
+            sampler_mode="euler",# 安定・高速な標準サンプラーに戻す
+            lm_temperature=0.8, # LMの温度を下げて、王道で破綻のないコード進行を生成させる
+            shift=shift_val,
+            dcw_enabled=dcw_val,
+            seed=shared_seed,
+        )
         
+        config = GenerationConfig(
+            batch_size=1,
+            audio_format=args.format,
+            bit_depth=args.bit_depth,
+        )
+        
+        # Compose
+        result = generate_music(
+            dit_handler,
+            llm_handler,
+            params=params,
+            config=config,
+            save_dir=temp_save_dir,
+        )
+        
+        # ---- 4. ファイルをユーザーのデスクトップへ移動 ----
+        desktop_dir = os.path.expanduser("~/Desktop")
+        if result.success and result.audios:
+            logger.info(f"🎶 楽曲の生成 ({version_name}) が正常に完了しました！")
+            for idx, audio in enumerate(result.audios):
+                temp_path = audio.get("path")
+                if temp_path and os.path.exists(temp_path):
+                    # 新しいファイル名を作成（バージョン名を含める）
+                    safe_theme = "".join([c for c in args.theme if c.isalnum() or c in " -_"])[:30]
+                    timestamp = int(time.time())
+                    final_name = f"Song_{safe_theme}_{version_name}_{timestamp}_{idx+1}.{args.format}"
+                    dest_path = os.path.join(desktop_dir, final_name)
+                    
+                    # デスクトップにコピー
+                    shutil.copy(temp_path, dest_path)
+                    logger.info(f"🎉 新しい楽曲をデスクトップに保存しました: {dest_path}")
+                    
+                    # Metadata (JSON) もコピー
+                    temp_json_path = os.path.splitext(temp_path)[0] + ".json"
+                    json_name = f"Song_{safe_theme}_{version_name}_{timestamp}_{idx+1}.json"
+                    json_dest_path = os.path.join(desktop_dir, json_name)
+                    if os.path.exists(temp_json_path):
+                        shutil.copy(temp_json_path, json_dest_path)
+                        logger.info(f"💾 メタデータ(JSON)をデスクトップに保存しました: {json_dest_path}")
+                    
+                    # 歌詞とキャプションのテキストファイルをデスクトップに出力
+                    lyrics_name = f"Lyrics_{safe_theme}_{version_name}_{timestamp}_{idx+1}.txt"
+                    lyrics_path = os.path.join(desktop_dir, lyrics_name)
+                    try:
+                        with open(lyrics_path, "w", encoding="utf-8") as f:
+                            f.write("=====================================================\n")
+                            f.write(f"🎵 Auto-Composer: Generated Lyrics ({version_name})\n")
+                            f.write(f"   Theme: {args.theme}\n")
+                            if actual_duration > 0:
+                                f.write(f"   Target Duration: {actual_duration}s\n")
+                            f.write("=====================================================\n\n")
+                            f.write("■ 歌詞（漢字かな混じり - 通常表示用）\n")
+                            f.write("-----------------------------------------------------\n")
+                            f.write(lyrics)
+                            f.write("\n\n")
+                            f.write("■ 歌詞（歌唱入力用）\n")
+                            f.write("-----------------------------------------------------\n")
+                            f.write(target_lyrics)
+                            f.write("\n\n")
+                            f.write("■ 音楽構成プロンプト (Music Caption - Ollama Direct)\n")
+                            f.write("-----------------------------------------------------\n")
+                            f.write(caption)
+                            f.write("\n")
+                        logger.info(f"📝 歌詞のテキストファイルをデスクトップに保存しました: {lyrics_path}")
+                    except Exception as lyrics_err:
+                        logger.warning(f"歌詞テキストファイルの保存に失敗しました: {str(lyrics_err)}")
+                    
+                    # 自動でファイルを開いてユーザーに通知（最後のバージョンの時のみ開く）
+                    if v_idx == len(versions) - 1:
+                        try:
+                            import platform
+                            if platform.system() == "Darwin":
+                                # QuickTime Playerを最前面に表示し、自動再生するAppleScript
+                                play_script = (
+                                    f"osascript "
+                                    f"-e 'tell application \"QuickTime Player\" to activate' "
+                                    f"-e 'tell application \"QuickTime Player\" to open POSIX file \"{dest_path}\"' "
+                                    f"-e 'tell application \"QuickTime Player\" to play document 1'"
+                                )
+                                os.system(play_script)
+                                if 'lyrics_path' in locals() and os.path.exists(lyrics_path):
+                                    os.system(f"open '{lyrics_path}'")
+                        except Exception:
+                            pass
+        else:
+            logger.error(f"楽曲の生成 ({version_name}) に失敗しました: {result.status_message}")
+            
+    # クリーニング
+    shutil.rmtree(temp_save_dir, ignore_errors=True)
+
     logger.info(f"✅ 全ての処理が完了しました。かかった時間: {time.time() - t_start:.1f} 秒")
 
 if __name__ == "__main__":
