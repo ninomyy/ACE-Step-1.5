@@ -960,13 +960,40 @@ def main():
                     shutil.copy(temp_path, dest_path)
                     logger.info(f"🎉 新しい楽曲をOutputディレクトリに保存しました: {dest_path}")
                     
-                    # Metadata (JSON) もコピー
-                    temp_json_path = os.path.splitext(temp_path)[0] + ".json"
+                    # Metadata (JSON) の保存（Upscalerが直接読み込める完全な設計図として保存）
                     json_name = f"Song_{safe_theme}_{version_name}_{timestamp}_{idx+1}.json"
                     json_dest_path = os.path.join(output_dir, json_name)
-                    if os.path.exists(temp_json_path):
-                        shutil.copy(temp_json_path, json_dest_path)
+                    
+                    # audio.get("params") から audio_codes や内部パラメータを取得
+                    raw_params = audio.get("params", {})
+                    audio_meta = raw_params.copy() if isinstance(raw_params, dict) else {}
+                    
+                    # Upscalerで必要な全フィールドを確実に補完・正規化
+                    audio_meta["caption"] = caption
+                    audio_meta["lyrics"] = target_lyrics
+                    audio_meta["vocal_language"] = "ja"
+                    audio_meta["theme"] = args.theme
+                    audio_meta["version_name"] = version_name
+                    if "seed" not in audio_meta or audio_meta["seed"] is None or audio_meta["seed"] == -1:
+                        audio_meta["seed"] = shared_seed
+                    if "duration" not in audio_meta or audio_meta["duration"] is None or audio_meta["duration"] <= 0:
+                        audio_meta["duration"] = actual_duration
+                    if "keyscale" not in audio_meta or not audio_meta["keyscale"]:
+                        audio_meta["keyscale"] = detected_key or ""
+                    if "bpm" not in audio_meta or not audio_meta["bpm"]:
+                        audio_meta["bpm"] = detected_bpm or ""
+                    if "timesignature" not in audio_meta or not audio_meta["timesignature"]:
+                        audio_meta["timesignature"] = detected_ts or ""
+                    audio_meta["model_type"] = args.model_type
+                    audio_meta["audio_format"] = args.format
+                    audio_meta["bit_depth"] = args.bit_depth
+                    
+                    try:
+                        with open(json_dest_path, "w", encoding="utf-8") as jf:
+                            json.dump(audio_meta, jf, indent=2, ensure_ascii=False)
                         logger.info(f"💾 メタデータ(JSON)をOutputディレクトリに保存しました: {json_dest_path}")
+                    except Exception as json_err:
+                        logger.warning(f"メタデータ(JSON)の保存に失敗しました: {json_err}")
                     
                     # 歌詞とキャプションのテキストファイルをOutputディレクトリに出力
                     lyrics_name = f"Lyrics_{safe_theme}_{version_name}_{timestamp}_{idx+1}.txt"

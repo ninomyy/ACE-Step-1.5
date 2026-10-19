@@ -101,8 +101,11 @@ def main():
     seed = metadata.get("seed", -1)
 
     if not audio_codes:
-        logger.error("❌ audio_codes not found in JSON. Cannot perform precise upscale without audio codes!")
-        sys.exit(1)
+        logger.warning("⚠️ audio_codesがJSONに含まれていません。Thinking=Trueでコード進行・メロディを新規構成し、SFT 50ステップで高品質レンダリングします。")
+        use_thinking = True
+    else:
+        logger.info("✨ 元の楽曲の設計図トークン (audio_codes) を検出しました。メロディ・歌唱を完全維持したままSFT 50ステップで高音質化します。")
+        use_thinking = False
 
     # ---- 2. モデルの初期化 ----
     logger.info("🚀 ACE-Step SFTモデルを初期化しています (Apple Silicon 最適化)...")
@@ -131,11 +134,11 @@ def main():
         sys.exit(1)
 
     # ---- 3. アップスケール用パラメータの構築 ----
-    # Upscale専用: thinking=False (既存のaudio_codesをそのまま使う), inference_steps=50, shift=3.0, dcw=False
+    # Upscale専用: audio_codesがある場合はthinking=False (既存のコードをそのまま使う), inference_steps=50, shift=3.0, dcw=False
     params = GenerationParams(
         task_type="text2music",
-        thinking=False, # 既存のAudio Codesを強制使用する
-        audio_codes=audio_codes,
+        thinking=use_thinking,
+        audio_codes=audio_codes if not use_thinking else "",
         caption=caption,
         lyrics=lyrics_hiragana,
         vocal_language=vocal_language,
