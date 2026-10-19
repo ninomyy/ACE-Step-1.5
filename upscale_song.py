@@ -50,8 +50,8 @@ from acestep.inference import (
     GenerationParams,
     generate_music,
 )
-from acestep.ui.gradio.events.generation.llm_init import init_llm
-from acestep.ui.gradio.events.generation.model_init import init_dit
+from acestep.handler import AceStepHandler
+from acestep.llm_inference import LLMHandler
 
 # ログの設定
 logging.basicConfig(
@@ -105,18 +105,29 @@ def main():
         sys.exit(1)
 
     # ---- 2. モデルの初期化 ----
-    logger.info("🚀 Initializing ACE-Step SFT Model...")
-    dit_handler = init_dit(None)
-    
-    # 念のため SFT モデルかチェック
-    model_id = getattr(dit_handler, 'model_id', '').lower()
-    if "sft" not in model_id:
-        logger.warning(f"⚠️ Warning: The currently loaded model ({model_id}) does not appear to be an SFT model.")
-        logger.warning("Upscaling will still run with SFT parameters, but quality may vary if an SFT model is not loaded.")
+    logger.info("🚀 ACE-Step SFTモデルを初期化しています (Apple Silicon 最適化)...")
+    dit_handler = AceStepHandler()
+    s_msg, s_success = dit_handler.initialize_service(
+        project_root=str(PROJECT_ROOT),
+        config_path="acestep-v15-xl-sft",
+        device="auto",
+        backend="mlx"
+    )
+    if not s_success:
+        logger.error(f"❌ SFTモデルの初期化に失敗しました: {s_msg}")
+        sys.exit(1)
         
-    llm_handler = init_llm(None)
-    if not llm_handler.llm_initialized:
-        logger.error("❌ Failed to initialize LLM. Please make sure LM path is configured.")
+    logger.info("🚀 4B 言語モデル (LLM) を初期化しています...")
+    llm_handler = LLMHandler()
+    s_msg, s_success = llm_handler.initialize_service(
+        project_root=str(PROJECT_ROOT),
+        checkpoint_dir=os.path.join(str(PROJECT_ROOT), "checkpoints"),
+        lm_model_path="acestep-5Hz-lm-4B",
+        device="auto",
+        backend="mlx"
+    )
+    if not s_success:
+        logger.error(f"❌ LLMの初期化に失敗しました: {s_msg}")
         sys.exit(1)
 
     # ---- 3. アップスケール用パラメータの構築 ----
