@@ -261,3 +261,15 @@ docs/.vitepress/dist/
 docs/.vitepress/cache/
 docs/en/awesome.md
 package-lock.json
+
+# Audio and AI Model weights protection
+*.flac
+*.wav
+*.mp3
+*.m4a
+*.ogg
+*.safetensors
+*.ckpt
+*.pt
+*.bin
+*.pth
