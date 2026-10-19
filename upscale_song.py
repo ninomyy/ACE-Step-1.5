@@ -5,6 +5,37 @@ import os
 import shutil
 import sys
 import time
+import subprocess
+
+# ---- 進捗表示 ＆ macOS通知ヘルパー関数 ----
+def set_terminal_title(title: str):
+    """ターミナルのウィンドウタイトルを進捗に合わせて動的に更新する"""
+    try:
+        sys.stdout.write(f"\033]0;{title}\007")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+def send_macos_notification(title: str, message: str, sound: str = "Glass"):
+    """macOSネイティブのデスクトップ通知を音付きで送信する"""
+    try:
+        clean_title = title.replace('"', '\\"')
+        clean_msg = message.replace('"', '\\"')
+        script = f'display notification "{clean_msg}" with title "{clean_title}" sound name "{sound}"'
+        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+def print_step_banner(step_num: int, total_steps: int, title: str, description: str = ""):
+    """見やすい日本語ステップバナーをターミナルに表示し、タイトルも更新する"""
+    percent = int((step_num - 1) / total_steps * 100)
+    set_terminal_title(f"[{percent}%] ({step_num}/{total_steps}) {title} - AutoComposer Upscaler")
+    bar = "=" * 62
+    print(f"\n{bar}")
+    print(f" ⚡【工程 {step_num}/{total_steps}】 {title}  (進捗目安: {percent}%)")
+    if description:
+        print(f"    ℹ️  {description}")
+    print(f"{bar}\n")
 
 # ACE-Step Paths
 from pathlib import Path
@@ -47,7 +78,11 @@ def main():
 
     t_start = time.time()
     
+    set_terminal_title("[0%] 準備中 - AutoComposer Upscaler")
+    send_macos_notification("⚡ AutoComposer Upscaler", "高音質アップスケール処理を開始しました。", sound="Hero")
+    
     # ---- 1. メタデータの読み込み ----
+    print_step_banner(1, 2, "📄 設計図の解析 ＆ SFTモデルの準備", "元の楽曲のシード値・プロンプト・構成コードを読み込み、SFTモデルを初期化しています...")
     logger.info(f"📄 Loading metadata from: {args.json}")
     try:
         metadata = load_json_metadata(args.json)
@@ -117,6 +152,7 @@ def main():
     os.makedirs(temp_save_dir, exist_ok=True)
     
     # ---- 4. 生成の実行 ----
+    print_step_banner(2, 2, "🎼 高音質アップスケール生成中 (50 Steps SFT)", "同じメロディのまま、高精細な本番品質（SFTモデル）で楽曲を再レンダリングしています...")
     logger.info("🎵 Starting high-quality SFT Upscale generation...")
     result = generate_music(
         dit_handler,
@@ -156,6 +192,13 @@ def main():
                     pass
                 
         shutil.rmtree(temp_save_dir, ignore_errors=True)
+        set_terminal_title("[100%] 🎉 アップスケール完了！ - AutoComposer Upscaler")
+        send_macos_notification("🎉 AutoComposer Upscaler", "高音質アップスケールが完了しました！デスクトップを確認してください。", sound="Glass")
+        print("\n" + "★" * 62)
+        print(" 🎉 高音質アップスケール（SFT）が正常に完了しました！")
+        print(f" ⏱️  総所要時間: {time.time() - t_start:.1f} 秒")
+        print(f" 📁 保存先: デスクトップ")
+        print("★" * 62 + "\n")
     else:
         logger.error(f"Failed to upscale music: {result.status_message}")
         shutil.rmtree(temp_save_dir, ignore_errors=True)

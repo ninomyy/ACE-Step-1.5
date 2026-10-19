@@ -5,7 +5,7 @@ This script runs entirely offline on local Mac, utilizing:
 1. Ollama (qwen2.5:32b) to write beautiful Japanese lyrics and generate English music captions.
 2. Memory release hack to immediately unload the 32B model from unified memory.
 3. ACE-Step 1.5 (4B LM + XL-turbo) to compose and generate high-quality FLAC/WAV songs.
-4. Saves final outputs directly to the user's Desktop.
+4. Saves final outputs directly to the user's ~/AutoComposer_Project/Output directory.
 """
 
 import os
@@ -15,6 +15,7 @@ import time
 import argparse
 import requests
 import shutil
+import subprocess
 from pathlib import Path
 
 # Increase ACE-Step internal generation timeout to 1 hour (3600s) to accommodate Heun sampler and 50 steps
@@ -23,6 +24,36 @@ os.environ["ACESTEP_GENERATION_TIMEOUT"] = "3600"
 # Add project root to Python path
 PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+# ---- 進捗表示 ＆ macOS通知ヘルパー関数 ----
+def set_terminal_title(title: str):
+    """ターミナルのウィンドウタイトルを進捗に合わせて動的に更新する"""
+    try:
+        sys.stdout.write(f"\033]0;{title}\007")
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+def send_macos_notification(title: str, message: str, sound: str = "Glass"):
+    """macOSネイティブのデスクトップ通知を音付きで送信する"""
+    try:
+        clean_title = title.replace('"', '\\"')
+        clean_msg = message.replace('"', '\\"')
+        script = f'display notification "{clean_msg}" with title "{clean_title}" sound name "{sound}"'
+        subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+    except Exception:
+        pass
+
+def print_step_banner(step_num: int, total_steps: int, title: str, description: str = ""):
+    """見やすい日本語ステップバナーをターミナルに表示し、タイトルも更新する"""
+    percent = int((step_num - 1) / total_steps * 100)
+    set_terminal_title(f"[{percent}%] ({step_num}/{total_steps}) {title} - AutoComposer")
+    bar = "=" * 62
+    print(f"\n{bar}")
+    print(f" 🎵【工程 {step_num}/{total_steps}】 {title}  (進捗目安: {percent}%)")
+    if description:
+        print(f"    ℹ️  {description}")
+    print(f"{bar}\n")
 
 from loguru import logger
 from acestep.handler import AceStepHandler
@@ -523,16 +554,18 @@ def main():
     if os.path.exists(args.theme):
         lyrics_file_path = args.theme
     else:
-        # Check Desktop folder
-        desktop_path = os.path.expanduser(f"~/Desktop/{args.theme}")
-        if os.path.exists(desktop_path) and args.theme.endswith(".txt"):
-            lyrics_file_path = desktop_path
+        # Check Input folder
+        input_dir = os.path.expanduser("~/AutoComposer_Project/Input")
+        os.makedirs(input_dir, exist_ok=True)
+        input_path = os.path.join(input_dir, args.theme)
+        if os.path.exists(input_path) and args.theme.endswith(".txt"):
+            lyrics_file_path = input_path
             
     # -- Action Mode Validation --
     if args.action_mode in ["reproduce", "random"]:
         if not lyrics_file_path:
             logger.error(f"❌ エラー: {args.action_mode} モードが選択されましたが、song_theme.txt に有効な歌詞ファイル (Lyrics_○○.txt) のパスが指定されていません。")
-            logger.error("処理を中断します。デスクトップの song_theme.txt を修正してから再度お試しください。")
+            logger.error("処理を中断します。Inputディレクトリの song_theme.txt またはパスを修正してから再度お試しください。")
             sys.exit(1)
             
     is_retry = False
@@ -591,6 +624,11 @@ def main():
         else:
             logger.error("Failed to parse lyrics file contents properly. Falling back to normal mode.")
             
+    total_steps = 2 if is_retry else 4
+    theme_display = args.theme[:25] + "..." if len(args.theme) > 25 else args.theme
+    set_terminal_title(f"[0%] 準備中: {theme_display} - AutoComposer")
+    send_macos_notification("🎵 AutoComposer", f"作曲プロセスを開始しました（テーマ: {theme_display}）", sound="Hero")
+            
     def init_models():
         config_path = "acestep-v15-xl-sft" if args.model_type == "sft" else "acestep-v15-xl-turbo"
         model_display_name = "SFT" if args.model_type == "sft" else "Turbo"
@@ -622,6 +660,7 @@ def main():
 
     if not is_retry:
         # ---- 1. Run Ollama 作詞 & プロンプト生成 ----
+        print_step_banner(1, total_steps, "✍️  AI作詞 ＆ 音楽プロンプト生成中 (Ollama Qwen)", "テーマに合わせたJ-POP王道構成の歌詞と英語音楽プロンプトを執筆しています...")
         caption, lyrics, lyrics_hiragana, lyrics_romaji = get_lyrics_and_caption_from_ollama(args.theme, args.duration, args.ollama_model)
         
         # LLMの幻覚（異なるBPMやKeyの出力）をユーザー指定値で強制上書き
@@ -644,6 +683,7 @@ def main():
         logger.info("生成された歌唱用ローマ字歌詞:")
         logger.info(lyrics_romaji)
         # ---- 2. 読み仮名「ダブルチェック」ロジック（ブロック単位比較） ----
+        print_step_banner(2, total_steps, "🔍 歌詞の読み仮名・発音調整中 (MeCab)", "歌唱AIが自然に発音できるよう、漢字をひらがな化し助詞（は・へ・を等）を補正しています...")
         logger.info("🔍 MeCab(最強辞書) を用いてAIのフリガナのダブルチェックを行います...")
         mecab_hiragana = convert_to_hiragana_mecab(lyrics)
         
@@ -860,6 +900,9 @@ def main():
         versions = [("hiragana", lyrics_hiragana), ("romaji", lyrics_romaji)]
     
     for v_idx, (version_name, target_lyrics) in enumerate(versions):
+        step_curr = (2 + v_idx + 1) if not is_retry else (1 + v_idx + 1)
+        v_label = "ひらがな歌唱版" if version_name == "hiragana" else ("ローマ字歌唱版" if version_name == "romaji" else "再生成版")
+        print_step_banner(step_curr, total_steps, f"🎼 楽曲レンダリング中: {v_label} (ACE-Step XL)", f"Apple Silicon GPU (MPS) でボーカル曲を生成中... (モデル: {args.model_type.upper()})")
         if not is_retry:
             logger.info(f"\n🚀 【A/Bテスト】バージョン '{version_name}' の生成を開始します (シード値固定: {shared_seed})")
             
@@ -899,8 +942,9 @@ def main():
             save_dir=temp_save_dir,
         )
         
-        # ---- 4. ファイルをユーザーのデスクトップへ移動 ----
-        desktop_dir = os.path.expanduser("~/Desktop")
+        # ---- 4. ファイルを専用のOutputディレクトリへ移動 ----
+        output_dir = os.path.expanduser("~/AutoComposer_Project/Output")
+        os.makedirs(output_dir, exist_ok=True)
         if result.success and result.audios:
             logger.info(f"🎶 楽曲の生成 ({version_name}) が正常に完了しました！")
             for idx, audio in enumerate(result.audios):
@@ -910,23 +954,23 @@ def main():
                     safe_theme = "".join([c for c in args.theme if c.isalnum() or c in " -_"])[:30]
                     timestamp = int(time.time())
                     final_name = f"Song_{safe_theme}_{version_name}_{timestamp}_{idx+1}.{args.format}"
-                    dest_path = os.path.join(desktop_dir, final_name)
+                    dest_path = os.path.join(output_dir, final_name)
                     
-                    # デスクトップにコピー
+                    # Outputディレクトリにコピー
                     shutil.copy(temp_path, dest_path)
-                    logger.info(f"🎉 新しい楽曲をデスクトップに保存しました: {dest_path}")
+                    logger.info(f"🎉 新しい楽曲をOutputディレクトリに保存しました: {dest_path}")
                     
                     # Metadata (JSON) もコピー
                     temp_json_path = os.path.splitext(temp_path)[0] + ".json"
                     json_name = f"Song_{safe_theme}_{version_name}_{timestamp}_{idx+1}.json"
-                    json_dest_path = os.path.join(desktop_dir, json_name)
+                    json_dest_path = os.path.join(output_dir, json_name)
                     if os.path.exists(temp_json_path):
                         shutil.copy(temp_json_path, json_dest_path)
-                        logger.info(f"💾 メタデータ(JSON)をデスクトップに保存しました: {json_dest_path}")
+                        logger.info(f"💾 メタデータ(JSON)をOutputディレクトリに保存しました: {json_dest_path}")
                     
-                    # 歌詞とキャプションのテキストファイルをデスクトップに出力
+                    # 歌詞とキャプションのテキストファイルをOutputディレクトリに出力
                     lyrics_name = f"Lyrics_{safe_theme}_{version_name}_{timestamp}_{idx+1}.txt"
-                    lyrics_path = os.path.join(desktop_dir, lyrics_name)
+                    lyrics_path = os.path.join(output_dir, lyrics_name)
                     try:
                         with open(lyrics_path, "w", encoding="utf-8") as f:
                             f.write("=====================================================\n")
@@ -947,7 +991,7 @@ def main():
                             f.write("-----------------------------------------------------\n")
                             f.write(caption)
                             f.write("\n")
-                        logger.info(f"📝 歌詞のテキストファイルをデスクトップに保存しました: {lyrics_path}")
+                        logger.info(f"📝 歌詞のテキストファイルをOutputディレクトリに保存しました: {lyrics_path}")
                     except Exception as lyrics_err:
                         logger.warning(f"歌詞テキストファイルの保存に失敗しました: {str(lyrics_err)}")
                     
@@ -974,6 +1018,15 @@ def main():
     # クリーニング
     shutil.rmtree(temp_save_dir, ignore_errors=True)
 
+    theme_display = args.theme[:25] + "..." if len(args.theme) > 25 else args.theme
+    set_terminal_title(f"[100%] 🎉 作曲完了！ - AutoComposer")
+    send_macos_notification("🎉 AutoComposer: 楽曲完成！", f"『{theme_display}』の楽曲がOutputフォルダに保存されました。", sound="Glass")
+
+    print("\n" + "★" * 62)
+    print(" 🎉 全ての工程が正常に完了しました！")
+    print(f" ⏱️  総所要時間: {time.time() - t_start:.1f} 秒")
+    print(f" 📁 完成ファイル保存先: ~/AutoComposer_Project/Output")
+    print("★" * 62 + "\n")
     logger.info(f"✅ 全ての処理が完了しました。かかった時間: {time.time() - t_start:.1f} 秒")
 
 if __name__ == "__main__":
