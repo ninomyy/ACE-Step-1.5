@@ -114,7 +114,7 @@ def main():
         project_root=str(PROJECT_ROOT),
         config_path="acestep-v15-xl-sft",
         device="auto",
-        backend="mlx"
+        offload_to_cpu=False,
     )
     if not s_success:
         logger.error(f"❌ SFTモデルの初期化に失敗しました: {s_msg}")
@@ -122,8 +122,7 @@ def main():
         
     logger.info("🚀 4B 言語モデル (LLM) を初期化しています...")
     llm_handler = LLMHandler()
-    s_msg, s_success = llm_handler.initialize_service(
-        project_root=str(PROJECT_ROOT),
+    s_msg, s_success = llm_handler.initialize(
         checkpoint_dir=os.path.join(str(PROJECT_ROOT), "checkpoints"),
         lm_model_path="acestep-5Hz-lm-4B",
         device="auto",
